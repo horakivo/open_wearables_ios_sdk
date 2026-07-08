@@ -89,12 +89,13 @@ extension OpenWearablesHealthSDK {
         wasFullExport: Bool = false,
         completion: @escaping (Bool) -> Void
     ) {
+        let encodeStart = Date()
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
             self.logMessage("Failed to serialize payload")
             completion(false)
             return
         }
-        
+
         let id = UUID().uuidString
         let payloadURL = newPath("combined_payload_\(id)", ext: "json")
         
@@ -139,19 +140,24 @@ extension OpenWearablesHealthSDK {
             completion(false)
             return
         }
-        
+        let encodeMs = Int(Date().timeIntervalSince(encodeStart) * 1000)
+
         var req = URLRequest(url: endpoint)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         applyAuth(to: &req, credential: credential)
         req.httpBody = payloadData
         req.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
-        
-        self.logPayloadSummary(payloadData, label: "Sending")
 
+        let summaryStart = Date()
+        self.logPayloadSummary(payloadData, label: "Sending")
+        let summaryMs = Int(Date().timeIntervalSince(summaryStart) * 1000)
+
+        let networkStart = Date()
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }
-            
+            let networkMs = Int(Date().timeIntervalSince(networkStart) * 1000)
+
             if let error = error {
                 let nsError = error as NSError
                 if nsError.code != NSURLErrorCancelled {
@@ -165,7 +171,7 @@ extension OpenWearablesHealthSDK {
             
             if let httpResponse = response as? HTTPURLResponse {
                 if (200...299).contains(httpResponse.statusCode) {
-                    self.logMessage("HTTP \(httpResponse.statusCode)")
+                    self.logMessage("HTTP \(httpResponse.statusCode) (encode \(encodeMs)ms, summary \(summaryMs)ms, network \(networkMs)ms, \(payloadData.count / 1024) KB)")
                     
                     self.handleSuccessfulUpload(itemPath: itemURL.path, anchorPath: anchorsURL?.path, wasFullExport: wasFullExport)
                     

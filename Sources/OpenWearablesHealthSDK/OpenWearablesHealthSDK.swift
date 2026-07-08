@@ -623,6 +623,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 } else {
                     self.logMessage("Sync incomplete - will resume remaining types later")
                 }
+                let totalSeconds = Date().timeIntervalSince(syncStartTime)
+                self.logMessage(String(format: "Sync finished in %.1fs (allTypesCompleted: %@)", totalSeconds, String(allTypesCompleted)))
                 self.fullSyncStartTime = nil
                 self.finishSync()
                 completion()
@@ -649,6 +651,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         var olderThanCursors: [String: Date] = [:]
         var anchorCursors: [String: HKQueryAnchor] = [:]
         var completedTypes: Set<String> = []
+        var round = 0
+        var totalItemsSent = 0
     }
     
     private func processTypesRoundRobin(
@@ -720,7 +724,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         let perTypeLimit = max(1, chunkLimit / incompleteTypes.count)
-        
+
+        rrState.round += 1
+        let roundIndex = rrState.round
+        let fetchStart = Date()
+
         // Phase 1: Fetch one chunk from each type (no network yet)
         fetchTypesInRound(
             types: incompleteTypes, index: 0, fullExport: fullExport,
@@ -728,6 +736,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         ) { [weak self] success, results in
             guard let self = self else { completion(false); return }
             if !success { completion(false); return }
+
+            let fetchMs = Int(Date().timeIntervalSince(fetchStart) * 1000)
             
             // Update cursors for types that aren't done
             for result in results where !result.isDone {
@@ -779,14 +789,21 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 return
             }
             
+            let mapStart = Date()
             let payload = self.serializeCombinedStreaming(samples: allSamples)
-            
+            let mapMs = Int(Date().timeIntervalSince(mapStart) * 1000)
+            let sendStart = Date()
+
             self.enqueueCombinedUpload(
                 payload: payload, anchors: [:], endpoint: endpoint,
                 credential: freshCredential, wasFullExport: false
             ) { [weak self] sendSuccess in
                 guard let self = self else { completion(false); return }
                 if !sendSuccess { completion(false); return }
+
+                let sendMs = Int(Date().timeIntervalSince(sendStart) * 1000)
+                rrState.totalItemsSent += allSamples.count
+                self.logMessage("Round \(roundIndex) timing: fetch \(fetchMs)ms, map \(mapMs)ms, send \(sendMs)ms (\(allSamples.count) items, \(withData.count) types, total \(rrState.totalItemsSent))")
                 
                 // Phase 3: Update progress for all types that had data
                 for result in withData {
