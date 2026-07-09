@@ -142,12 +142,23 @@ extension OpenWearablesHealthSDK {
         }
         let encodeMs = Int(Date().timeIntervalSince(encodeStart) * 1000)
 
+        let gzipStart = Date()
+        let gzippedBody = payloadData.gzipped()
+        if gzippedBody == nil {
+            logMessage("Payload gzip failed, sending uncompressed")
+        }
+        let gzipMs = Int(Date().timeIntervalSince(gzipStart) * 1000)
+        let body = gzippedBody ?? payloadData
+
         var req = URLRequest(url: endpoint)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if gzippedBody != nil {
+            req.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
+        }
         applyAuth(to: &req, credential: credential)
-        req.httpBody = payloadData
-        req.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
+        req.httpBody = body
+        req.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
 
         let summaryStart = Date()
         self.logPayloadSummary(payloadData, label: "Sending")
@@ -171,7 +182,7 @@ extension OpenWearablesHealthSDK {
             
             if let httpResponse = response as? HTTPURLResponse {
                 if (200...299).contains(httpResponse.statusCode) {
-                    self.logMessage("HTTP \(httpResponse.statusCode) (encode \(encodeMs)ms, summary \(summaryMs)ms, network \(networkMs)ms, \(payloadData.count / 1024) KB)")
+                    self.logMessage("HTTP \(httpResponse.statusCode) (encode \(encodeMs)ms, gzip \(gzipMs)ms, summary \(summaryMs)ms, network \(networkMs)ms, \(payloadData.count / 1024) KB -> \(body.count / 1024) KB)")
                     
                     self.handleSuccessfulUpload(itemPath: itemURL.path, anchorPath: anchorsURL?.path, wasFullExport: wasFullExport)
                     
@@ -179,7 +190,8 @@ extension OpenWearablesHealthSDK {
                     completion(true)
                 } else if httpResponse.statusCode == 401 {
                     self.handle401ForUpload(
-                        payloadData: payloadData,
+                        payloadData: body,
+                        isGzipped: gzippedBody != nil,
                         endpoint: endpoint,
                         itemPath: itemURL.path,
                         payloadPath: payloadURL.path,
@@ -217,6 +229,7 @@ extension OpenWearablesHealthSDK {
     /// Handles 401 response for combined uploads.
     private func handle401ForUpload(
         payloadData: Data,
+        isGzipped: Bool,
         endpoint: URL,
         itemPath: String,
         payloadPath: String,
@@ -250,6 +263,9 @@ extension OpenWearablesHealthSDK {
                 var retryReq = URLRequest(url: endpoint)
                 retryReq.httpMethod = "POST"
                 retryReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                if isGzipped {
+                    retryReq.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
+                }
                 self.applyAuth(to: &retryReq, credential: newCredential)
                 retryReq.httpBody = payloadData
                 retryReq.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
