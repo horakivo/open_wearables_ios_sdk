@@ -80,89 +80,87 @@ extension OpenWearablesHealthSDK {
         completion()
     }
     
-    // MARK: - Combined upload
-    internal func enqueueCombinedUpload(
-        payload: [String: Any],
-        anchors: [String: HKQueryAnchor],
-        endpoint: URL,
-        credential: String,
-        wasFullExport: Bool = false,
-        completion: @escaping (Bool) -> Void
-    ) {
+    // MARK: - Combined upload (prepare during prefetch, send on the critical path)
+
+    /// A serialized, compressed, outbox-persisted upload ready to be sent.
+    /// Built during round prefetch so only the network transfer remains on
+    /// the sync's critical path.
+    internal struct PreparedUpload {
+        let body: Data
+        let isGzipped: Bool
+        let rawByteCount: Int
+        let payloadPath: String
+        let itemPath: String
+        let encodeMs: Int
+        let gzipMs: Int
+    }
+
+    /// CPU/disk half of the upload: JSON-encode, persist to the outbox, gzip.
+    /// Returns nil (after logging) if the payload could not be serialized.
+    internal func prepareUpload(payload: [String: Any]) -> PreparedUpload? {
         let encodeStart = Date()
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
-            self.logMessage("Failed to serialize payload")
-            completion(false)
-            return
+            logMessage("Failed to serialize payload")
+            return nil
         }
 
         let id = UUID().uuidString
         let payloadURL = newPath("combined_payload_\(id)", ext: "json")
-        
+
         do {
             try data.write(to: payloadURL, options: Data.WritingOptions.atomic)
         } catch {
-            self.logMessage("Failed to write payload: \(error.localizedDescription)")
-            completion(false)
-            return
-        }
-
-        var anchorsURL: URL? = nil
-        if !anchors.isEmpty {
-            var anchorsData: [String: Data] = [:]
-            for (typeId, anchor) in anchors {
-                if let data = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) {
-                    anchorsData[typeId] = data
-                }
-            }
-            
-            if let serializedData = try? NSKeyedArchiver.archivedData(withRootObject: anchorsData, requiringSecureCoding: true) {
-                let u = newPath("combined_anchors_\(id)", ext: "bin")
-                try? serializedData.write(to: u, options: Data.WritingOptions.atomic)
-                anchorsURL = u
-            }
+            logMessage("Failed to write payload: \(error.localizedDescription)")
+            return nil
         }
 
         let item = OutboxItem(
             typeIdentifier: "combined",
             userKey: userKey(),
             payloadPath: payloadURL.path,
-            anchorPath: anchorsURL?.path,
-            wasFullExport: wasFullExport
+            anchorPath: nil,
+            wasFullExport: false
         )
         let itemURL = newPath("combined_item_\(id)", ext: "json")
         if let md = try? JSONEncoder().encode(item) {
             try? md.write(to: itemURL, options: Data.WritingOptions.atomic)
         }
-
-        guard let payloadData = try? Data(contentsOf: payloadURL) else {
-            self.logMessage("Failed to read payload")
-            completion(false)
-            return
-        }
         let encodeMs = Int(Date().timeIntervalSince(encodeStart) * 1000)
 
         let gzipStart = Date()
-        let gzippedBody = payloadData.gzipped()
+        let gzippedBody = data.gzipped()
         if gzippedBody == nil {
             logMessage("Payload gzip failed, sending uncompressed")
         }
         let gzipMs = Int(Date().timeIntervalSince(gzipStart) * 1000)
-        let body = gzippedBody ?? payloadData
 
+        return PreparedUpload(
+            body: gzippedBody ?? data,
+            isGzipped: gzippedBody != nil,
+            rawByteCount: data.count,
+            payloadPath: payloadURL.path,
+            itemPath: itemURL.path,
+            encodeMs: encodeMs,
+            gzipMs: gzipMs
+        )
+    }
+
+    /// Network half of the upload.
+    internal func sendPreparedUpload(
+        _ prepared: PreparedUpload,
+        endpoint: URL,
+        credential: String,
+        completion: @escaping (Bool) -> Void
+    ) {
         var req = URLRequest(url: endpoint)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if gzippedBody != nil {
+        if prepared.isGzipped {
             req.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
         }
         applyAuth(to: &req, credential: credential)
-        req.httpBody = body
-        req.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
-
-        let summaryStart = Date()
-        self.logPayloadSummary(payloadData, label: "Sending")
-        let summaryMs = Int(Date().timeIntervalSince(summaryStart) * 1000)
+        req.httpBody = prepared.body
+        req.setValue("\(prepared.body.count)", forHTTPHeaderField: "Content-Length")
 
         let networkStart = Date()
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
@@ -175,28 +173,28 @@ extension OpenWearablesHealthSDK {
                     self.logMessage("Upload error: \(error.localizedDescription)")
                     self.markNetworkError()
                 }
-                try? FileManager.default.removeItem(atPath: payloadURL.path)
+                try? FileManager.default.removeItem(atPath: prepared.payloadPath)
                 completion(false)
                 return
             }
-            
+
             if let httpResponse = response as? HTTPURLResponse {
                 if (200...299).contains(httpResponse.statusCode) {
-                    self.logMessage("HTTP \(httpResponse.statusCode) (encode \(encodeMs)ms, gzip \(gzipMs)ms, summary \(summaryMs)ms, network \(networkMs)ms, \(payloadData.count / 1024) KB -> \(body.count / 1024) KB)")
-                    
-                    self.handleSuccessfulUpload(itemPath: itemURL.path, anchorPath: anchorsURL?.path, wasFullExport: wasFullExport)
-                    
-                    try? FileManager.default.removeItem(atPath: payloadURL.path)
+                    self.logMessage("HTTP \(httpResponse.statusCode) (network \(networkMs)ms, \(prepared.rawByteCount / 1024) KB -> \(prepared.body.count / 1024) KB)")
+
+                    self.handleSuccessfulUpload(itemPath: prepared.itemPath, anchorPath: nil, wasFullExport: false)
+
+                    try? FileManager.default.removeItem(atPath: prepared.payloadPath)
                     completion(true)
                 } else if httpResponse.statusCode == 401 {
                     self.handle401ForUpload(
-                        payloadData: body,
-                        isGzipped: gzippedBody != nil,
+                        payloadData: prepared.body,
+                        isGzipped: prepared.isGzipped,
                         endpoint: endpoint,
-                        itemPath: itemURL.path,
-                        payloadPath: payloadURL.path,
-                        anchorsPath: anchorsURL?.path,
-                        wasFullExport: wasFullExport,
+                        itemPath: prepared.itemPath,
+                        payloadPath: prepared.payloadPath,
+                        anchorsPath: nil,
+                        wasFullExport: false,
                         completion: completion
                     )
                 } else {
@@ -206,8 +204,8 @@ extension OpenWearablesHealthSDK {
                         errorMsg += " - \(truncated)"
                     }
                     self.logMessage(errorMsg)
-                    try? FileManager.default.removeItem(atPath: payloadURL.path)
-                    
+                    try? FileManager.default.removeItem(atPath: prepared.payloadPath)
+
                     if (400...499).contains(httpResponse.statusCode) {
                         self.logMessage("Skipping chunk due to \(httpResponse.statusCode) - continuing sync")
                         completion(true)
@@ -218,11 +216,11 @@ extension OpenWearablesHealthSDK {
             } else {
                 self.logMessage("No HTTP response")
                 self.markNetworkError()
-                try? FileManager.default.removeItem(atPath: payloadURL.path)
+                try? FileManager.default.removeItem(atPath: prepared.payloadPath)
                 completion(false)
             }
         }
-        
+
         task.resume()
     }
     

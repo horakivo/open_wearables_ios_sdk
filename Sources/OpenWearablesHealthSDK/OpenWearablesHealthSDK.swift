@@ -41,7 +41,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.13.3"
+    internal static let sdkVersion = "0.13.4"
     
     // MARK: - Public Callbacks
     
@@ -110,7 +110,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal var trackedTypes: [HKSampleType] = []
     internal var chunkSize: Int = 1000
     internal var backgroundChunkSize: Int = 100
-    internal var recordsPerChunk: Int = 2000
+    internal var recordsPerChunk: Int = 8000
     
     // Debouncing
     private var pendingSyncWorkItem: DispatchWorkItem?
@@ -632,17 +632,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         if effectiveFullExport {
-            let startDate = syncStartDate()
-            let endDate = Date()
-            countSamplesForTypes(queryableTypes, startDate: startDate, endDate: endDate) { [weak self] counts in
-                guard let self = self else { return }
-                self.sendSyncStartLog(types: queryableTypes, typeCounts: counts, startDate: startDate, endDate: endDate) {
-                    startRoundRobin()
-                }
-            }
-        } else {
-            startRoundRobin()
+            // Fire-and-forget: don't block the first round on telemetry.
+            sendSyncStartLog(types: queryableTypes, startDate: syncStartDate(), endDate: Date()) { }
         }
+        startRoundRobin()
     }
     
     // MARK: - Round-Robin Sync Orchestration
@@ -703,17 +696,20 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Round-Robin with combined payloads, pipelined read + upload
 
-    /// One fetched round awaiting upload/commit. Session-local cursors and
-    /// completions in `RoundRobinState` already reflect it, so the next round
-    /// can be prefetched while this one uploads; durable progress is written
-    /// only in `commitRound` after the upload succeeds.
+    /// One fetched, serialized, compressed round awaiting upload/commit.
+    /// Session-local cursors and completions in `RoundRobinState` already
+    /// reflect it, so the next round can be prefetched while this one uploads;
+    /// durable progress is written only in `commitRound` after the upload
+    /// succeeds.
     private struct PendingRound {
-        let allSamples: [HKSample]
         let withData: [TypeRoundResult]
         let emptyDone: [TypeRoundResult]
         let anchorCaptureTypes: [HKSampleType]
+        let itemCount: Int
+        let prepared: PreparedUpload?
         let roundIndex: Int
         let fetchMs: Int
+        let mapMs: Int
     }
 
     /// Fetches one round from HealthKit and advances session-local cursors.
@@ -747,7 +743,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         fetchTypesInRound(
             types: incompleteTypes, index: 0, fullExport: fullExport,
             chunkLimit: perTypeLimit, rrState: rrState, accumulated: []
-        ) { success, results in
+        ) { [weak self] success, results in
+            guard let self = self else { completion(false, nil); return }
             if !success { completion(false, nil); return }
 
             let fetchMs = Int(Date().timeIntervalSince(fetchStart) * 1000)
@@ -767,13 +764,32 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
 
             let withData = results.filter { !$0.samples.isEmpty }
+            let allSamples = withData.flatMap { $0.samples }
+
+            // Serialize and compress here too, so the round's whole CPU cost
+            // rides along with the prefetch, hidden under the previous upload.
+            var prepared: PreparedUpload? = nil
+            var mapMs = 0
+            if !allSamples.isEmpty {
+                let mapStart = Date()
+                let payload = self.serializeCombinedStreaming(samples: allSamples)
+                mapMs = Int(Date().timeIntervalSince(mapStart) * 1000)
+                guard let upload = self.prepareUpload(payload: payload) else {
+                    completion(false, nil)
+                    return
+                }
+                prepared = upload
+            }
+
             let round = PendingRound(
-                allSamples: withData.flatMap { $0.samples },
                 withData: withData,
                 emptyDone: results.filter { $0.samples.isEmpty && $0.isDone },
                 anchorCaptureTypes: fullExport ? results.filter { $0.isDone }.map { $0.type } : [],
+                itemCount: allSamples.count,
+                prepared: prepared,
                 roundIndex: roundIndex,
-                fetchMs: fetchMs
+                fetchMs: fetchMs,
+                mapMs: mapMs
             )
             completion(true, round)
         }
@@ -836,7 +852,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
 
         // Rounds without data have no upload to overlap: commit and move on.
-        if current.allSamples.isEmpty {
+        guard let prepared = current.prepared else {
             commitRound(current, fullExport: fullExport, rrState: rrState) { [weak self] in
                 guard let self = self else { completion(false); return }
                 self.pipelineRounds(
@@ -854,9 +870,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
 
-        let mapStart = Date()
-        let payload = serializeCombinedStreaming(samples: current.allSamples)
-        let mapMs = Int(Date().timeIntervalSince(mapStart) * 1000)
+        // Per-type counts are known from the fetch — no payload re-parse.
+        let breakdown = current.withData
+            .sorted { $0.count > $1.count }
+            .map { "\(shortTypeName($0.type.identifier)): \($0.count)" }
+            .joined(separator: ", ")
+        logMessage("Sending \(prepared.body.count / 1024) KB, \(current.itemCount) items (\(breakdown))")
+
         let sendStart = Date()
 
         let group = DispatchGroup()
@@ -865,10 +885,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         var nextRound: PendingRound?
 
         group.enter()
-        enqueueCombinedUpload(
-            payload: payload, anchors: [:], endpoint: endpoint,
-            credential: freshCredential, wasFullExport: false
-        ) { sendSuccess in
+        sendPreparedUpload(prepared, endpoint: endpoint, credential: freshCredential) { sendSuccess in
             uploadOK = sendSuccess
             group.leave()
         }
@@ -885,8 +902,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             if !uploadOK { completion(false); return }
 
             let sendMs = Int(Date().timeIntervalSince(sendStart) * 1000)
-            rrState.totalItemsSent += current.allSamples.count
-            self.logMessage("Round \(current.roundIndex) timing: fetch \(current.fetchMs)ms, map \(mapMs)ms, send \(sendMs)ms (\(current.allSamples.count) items, \(current.withData.count) types, total \(rrState.totalItemsSent))")
+            rrState.totalItemsSent += current.itemCount
+            self.logMessage("Round \(current.roundIndex) timing: fetch \(current.fetchMs)ms, map \(current.mapMs)ms, prep \(prepared.encodeMs + prepared.gzipMs)ms, send \(sendMs)ms (\(current.itemCount) items, \(current.withData.count) types, total \(rrState.totalItemsSent))")
 
             self.commitRound(current, fullExport: fullExport, rrState: rrState) {
                 if !prefetchOK { completion(false); return }
@@ -1309,43 +1326,47 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     // MARK: - Payload Logging
-    
-    internal func logPayloadSummary(_ data: Data, label: String) {
-        let sizeKB = Double(data.count) / 1024
-        
-        guard let jsonObject = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
-              let dataDict = jsonObject["data"] as? [String: Any] else {
-            logMessage("\(label): \(String(format: "%.0f", sizeKB)) KB")
-            return
-        }
-        
-        var typeCounts: [String: Int] = [:]
-        
-        if let records = dataDict["records"] as? [[String: Any]] {
-            for record in records {
-                guard let type = record["type"] as? String else { continue }
-                let shortType = type
-                    .replacingOccurrences(of: "HKQuantityTypeIdentifier", with: "")
-                    .replacingOccurrences(of: "HKCategoryTypeIdentifier", with: "")
-                typeCounts[shortType, default: 0] += 1
-            }
-        }
-        if let sleep = dataDict["sleep"] as? [[String: Any]], !sleep.isEmpty {
-            typeCounts["sleep"] = sleep.count
-        }
-        if let workouts = dataDict["workouts"] as? [[String: Any]], !workouts.isEmpty {
-            typeCounts["workouts"] = workouts.count
-        }
-        
-        let totalCount = typeCounts.values.reduce(0, +)
-        let breakdown = typeCounts
-            .sorted { $0.value > $1.value }
-            .map { "\($0.key): \($0.value)" }
-            .joined(separator: ", ")
-        
-        logMessage("\(label) \(String(format: "%.0f", sizeKB)) KB, \(totalCount) items (\(breakdown))")
-    }
-    
+
+    // Unused since pre-serialization: the "Sending" breakdown is now built from
+    // per-type fetch counts in pipelineRounds, which avoids re-parsing the whole
+    // JSON payload (~17ms per round). Kept for debugging arbitrary payload Data.
+    //
+    // internal func logPayloadSummary(_ data: Data, label: String) {
+    //     let sizeKB = Double(data.count) / 1024
+    //
+    //     guard let jsonObject = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+    //           let dataDict = jsonObject["data"] as? [String: Any] else {
+    //         logMessage("\(label): \(String(format: "%.0f", sizeKB)) KB")
+    //         return
+    //     }
+    //
+    //     var typeCounts: [String: Int] = [:]
+    //
+    //     if let records = dataDict["records"] as? [[String: Any]] {
+    //         for record in records {
+    //             guard let type = record["type"] as? String else { continue }
+    //             let shortType = type
+    //                 .replacingOccurrences(of: "HKQuantityTypeIdentifier", with: "")
+    //                 .replacingOccurrences(of: "HKCategoryTypeIdentifier", with: "")
+    //             typeCounts[shortType, default: 0] += 1
+    //         }
+    //     }
+    //     if let sleep = dataDict["sleep"] as? [[String: Any]], !sleep.isEmpty {
+    //         typeCounts["sleep"] = sleep.count
+    //     }
+    //     if let workouts = dataDict["workouts"] as? [[String: Any]], !workouts.isEmpty {
+    //         typeCounts["workouts"] = workouts.count
+    //     }
+    //
+    //     let totalCount = typeCounts.values.reduce(0, +)
+    //     let breakdown = typeCounts
+    //         .sorted { $0.value > $1.value }
+    //         .map { "\($0.key): \($0.value)" }
+    //         .joined(separator: ", ")
+    //
+    //     logMessage("\(label) \(String(format: "%.0f", sizeKB)) KB, \(totalCount) items (\(breakdown))")
+    // }
+
     // MARK: - Network Monitoring
     
     internal func startNetworkMonitoring() {
