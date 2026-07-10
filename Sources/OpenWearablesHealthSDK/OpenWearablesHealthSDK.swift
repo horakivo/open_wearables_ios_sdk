@@ -41,7 +41,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.13.2"
+    internal static let sdkVersion = "0.13.3"
     
     // MARK: - Public Callbacks
     
@@ -682,9 +682,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
         }
         
-        processNextRound(
+        pipelineRounds(
             types: types, fullExport: fullExport, endpoint: endpoint,
-            chunkLimit: chunkLimit, rrState: rrState,
+            chunkLimit: chunkLimit, rrState: rrState, current: nil,
             completion: completion
         )
     }
@@ -701,145 +701,201 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let isDone: Bool
     }
     
-    // MARK: - Round-Robin with combined payloads
-    
-    private func processNextRound(
-        types: [HKSampleType], fullExport: Bool, endpoint: URL,
-        chunkLimit: Int, rrState: RoundRobinState,
-        completion: @escaping (Bool) -> Void
+    // MARK: - Round-Robin with combined payloads, pipelined read + upload
+
+    /// One fetched round awaiting upload/commit. Session-local cursors and
+    /// completions in `RoundRobinState` already reflect it, so the next round
+    /// can be prefetched while this one uploads; durable progress is written
+    /// only in `commitRound` after the upload succeeds.
+    private struct PendingRound {
+        let allSamples: [HKSample]
+        let withData: [TypeRoundResult]
+        let emptyDone: [TypeRoundResult]
+        let anchorCaptureTypes: [HKSampleType]
+        let roundIndex: Int
+        let fetchMs: Int
+    }
+
+    /// Fetches one round from HealthKit and advances session-local cursors.
+    /// Calls back with (true, nil) when every type is already complete.
+    private func fetchRound(
+        types: [HKSampleType], fullExport: Bool, chunkLimit: Int,
+        rrState: RoundRobinState,
+        completion: @escaping (Bool, PendingRound?) -> Void
     ) {
         syncLock.lock()
         let cancelled = syncCancelled
         syncLock.unlock()
         if cancelled {
             logMessage("Sync cancelled - stopping round-robin")
-            completion(false)
+            completion(false, nil)
             return
         }
-        
+
         let incompleteTypes = types.filter { !rrState.completedTypes.contains($0.identifier) }
         if incompleteTypes.isEmpty {
-            completion(true)
+            completion(true, nil)
             return
         }
-        
+
         let perTypeLimit = max(1, chunkLimit / incompleteTypes.count)
 
         rrState.round += 1
         let roundIndex = rrState.round
         let fetchStart = Date()
 
-        // Phase 1: Fetch one chunk from each type (no network yet)
         fetchTypesInRound(
             types: incompleteTypes, index: 0, fullExport: fullExport,
             chunkLimit: perTypeLimit, rrState: rrState, accumulated: []
-        ) { [weak self] success, results in
-            guard let self = self else { completion(false); return }
-            if !success { completion(false); return }
+        ) { success, results in
+            if !success { completion(false, nil); return }
 
             let fetchMs = Int(Date().timeIntervalSince(fetchStart) * 1000)
-            
-            // Update cursors for types that aren't done
-            for result in results where !result.isDone {
-                if fullExport {
+
+            // Session-local advancement only, so the next prefetch continues
+            // past this round even before its upload is confirmed. If the
+            // upload fails, this state is discarded and the resumed sync
+            // refetches from durable progress.
+            for result in results {
+                if result.isDone {
+                    rrState.completedTypes.insert(result.type.identifier)
+                } else if fullExport {
                     rrState.olderThanCursors[result.type.identifier] = result.nextOlderThan
                 } else if let anchor = result.newAnchor {
                     rrState.anchorCursors[result.type.identifier] = anchor
                 }
             }
-            
-            // Mark empty/done types (no data to send) as complete immediately
-            let emptyDone = results.filter { $0.samples.isEmpty && $0.isDone }
-            for result in emptyDone {
-                if !fullExport {
-                    self.updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
-                }
-                rrState.completedTypes.insert(result.type.identifier)
-                if fullExport { self.fireTypeCompletedLog(result.type.identifier) }
-            }
-            
-            // Phase 2: Build combined payload from all types that returned data
+
             let withData = results.filter { !$0.samples.isEmpty }
-            let allSamples = withData.flatMap { $0.samples }
-            
-            let doneTypesForAnchorCapture = results.filter { $0.isDone }.map { $0.type }
-            
-            if allSamples.isEmpty {
-                if fullExport && !doneTypesForAnchorCapture.isEmpty {
-                    self.captureAnchorsForDoneTypes(types: doneTypesForAnchorCapture, index: 0, rrState: rrState) {
-                        self.processNextRound(
-                            types: types, fullExport: fullExport, endpoint: endpoint,
-                            chunkLimit: chunkLimit, rrState: rrState,
-                            completion: completion
-                        )
-                    }
-                } else {
-                    self.processNextRound(
-                        types: types, fullExport: fullExport, endpoint: endpoint,
-                        chunkLimit: chunkLimit, rrState: rrState,
-                        completion: completion
-                    )
-                }
-                return
-            }
-            
-            guard let freshCredential = self.authCredential else {
-                self.logMessage("No auth credential available for upload")
-                completion(false)
-                return
-            }
-            
-            let mapStart = Date()
-            let payload = self.serializeCombinedStreaming(samples: allSamples)
-            let mapMs = Int(Date().timeIntervalSince(mapStart) * 1000)
-            let sendStart = Date()
+            let round = PendingRound(
+                allSamples: withData.flatMap { $0.samples },
+                withData: withData,
+                emptyDone: results.filter { $0.samples.isEmpty && $0.isDone },
+                anchorCaptureTypes: fullExport ? results.filter { $0.isDone }.map { $0.type } : [],
+                roundIndex: roundIndex,
+                fetchMs: fetchMs
+            )
+            completion(true, round)
+        }
+    }
 
-            self.enqueueCombinedUpload(
-                payload: payload, anchors: [:], endpoint: endpoint,
-                credential: freshCredential, wasFullExport: false
-            ) { [weak self] sendSuccess in
+    /// Durably records a round's progress. Called only after the round's
+    /// upload succeeded (or immediately for rounds that carried no data).
+    private func commitRound(
+        _ round: PendingRound, fullExport: Bool, rrState: RoundRobinState,
+        completion: @escaping () -> Void
+    ) {
+        if !fullExport {
+            for result in round.emptyDone {
+                updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
+            }
+        }
+
+        for result in round.withData {
+            if fullExport {
+                updateTypeProgress(
+                    typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                    isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
+                )
+            } else {
+                updateTypeProgress(
+                    typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                    isComplete: result.isDone, anchorData: result.anchorData
+                )
+            }
+        }
+
+        if fullExport && !round.anchorCaptureTypes.isEmpty {
+            captureAnchorsForDoneTypes(types: round.anchorCaptureTypes, index: 0, rrState: rrState, completion: completion)
+        } else {
+            completion()
+        }
+    }
+
+    /// Pipelined round loop: uploads `current` while prefetching the next
+    /// round from HealthKit, then commits `current` once its upload succeeds.
+    private func pipelineRounds(
+        types: [HKSampleType], fullExport: Bool, endpoint: URL,
+        chunkLimit: Int, rrState: RoundRobinState,
+        current: PendingRound?,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let current = current else {
+            // Nothing in hand (first round): fetch, then continue.
+            fetchRound(types: types, fullExport: fullExport, chunkLimit: chunkLimit, rrState: rrState) { [weak self] success, round in
                 guard let self = self else { completion(false); return }
-                if !sendSuccess { completion(false); return }
+                if !success { completion(false); return }
+                guard let round = round else { completion(true); return }
+                self.pipelineRounds(
+                    types: types, fullExport: fullExport, endpoint: endpoint,
+                    chunkLimit: chunkLimit, rrState: rrState, current: round,
+                    completion: completion
+                )
+            }
+            return
+        }
 
-                let sendMs = Int(Date().timeIntervalSince(sendStart) * 1000)
-                rrState.totalItemsSent += allSamples.count
-                self.logMessage("Round \(roundIndex) timing: fetch \(fetchMs)ms, map \(mapMs)ms, send \(sendMs)ms (\(allSamples.count) items, \(withData.count) types, total \(rrState.totalItemsSent))")
-                
-                // Phase 3: Update progress for all types that had data
-                for result in withData {
-                    if fullExport {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
-                        )
-                    } else {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: result.isDone, anchorData: result.anchorData
-                        )
-                        if result.isDone {
-                            rrState.completedTypes.insert(result.type.identifier)
-                        }
-                    }
-                }
-                
-                // Phase 4: For full export, capture anchors for done types
-                let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
-                if fullExport && !fullExportDone.isEmpty {
-                    self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) {
-                        self.processNextRound(
-                            types: types, fullExport: fullExport, endpoint: endpoint,
-                            chunkLimit: chunkLimit, rrState: rrState,
-                            completion: completion
-                        )
-                    }
-                } else {
-                    self.processNextRound(
-                        types: types, fullExport: fullExport, endpoint: endpoint,
-                        chunkLimit: chunkLimit, rrState: rrState,
-                        completion: completion
-                    )
-                }
+        // Rounds without data have no upload to overlap: commit and move on.
+        if current.allSamples.isEmpty {
+            commitRound(current, fullExport: fullExport, rrState: rrState) { [weak self] in
+                guard let self = self else { completion(false); return }
+                self.pipelineRounds(
+                    types: types, fullExport: fullExport, endpoint: endpoint,
+                    chunkLimit: chunkLimit, rrState: rrState, current: nil,
+                    completion: completion
+                )
+            }
+            return
+        }
+
+        guard let freshCredential = authCredential else {
+            logMessage("No auth credential available for upload")
+            completion(false)
+            return
+        }
+
+        let mapStart = Date()
+        let payload = serializeCombinedStreaming(samples: current.allSamples)
+        let mapMs = Int(Date().timeIntervalSince(mapStart) * 1000)
+        let sendStart = Date()
+
+        let group = DispatchGroup()
+        var uploadOK = false
+        var prefetchOK = false
+        var nextRound: PendingRound?
+
+        group.enter()
+        enqueueCombinedUpload(
+            payload: payload, anchors: [:], endpoint: endpoint,
+            credential: freshCredential, wasFullExport: false
+        ) { sendSuccess in
+            uploadOK = sendSuccess
+            group.leave()
+        }
+
+        group.enter()
+        fetchRound(types: types, fullExport: fullExport, chunkLimit: chunkLimit, rrState: rrState) { success, round in
+            prefetchOK = success
+            nextRound = round
+            group.leave()
+        }
+
+        group.notify(queue: .global(qos: .utility)) { [weak self] in
+            guard let self = self else { completion(false); return }
+            if !uploadOK { completion(false); return }
+
+            let sendMs = Int(Date().timeIntervalSince(sendStart) * 1000)
+            rrState.totalItemsSent += current.allSamples.count
+            self.logMessage("Round \(current.roundIndex) timing: fetch \(current.fetchMs)ms, map \(mapMs)ms, send \(sendMs)ms (\(current.allSamples.count) items, \(current.withData.count) types, total \(rrState.totalItemsSent))")
+
+            self.commitRound(current, fullExport: fullExport, rrState: rrState) {
+                if !prefetchOK { completion(false); return }
+                guard let next = nextRound else { completion(true); return }
+                self.pipelineRounds(
+                    types: types, fullExport: fullExport, endpoint: endpoint,
+                    chunkLimit: chunkLimit, rrState: rrState, current: next,
+                    completion: completion
+                )
             }
         }
     }
