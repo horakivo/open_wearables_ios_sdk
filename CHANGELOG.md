@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.14.0
+
+* **Deletion propagation**: samples deleted from HealthKit are now reported to the server. The anchored queries used for incremental sync already receive `HKDeletedObject` tombstones; they were previously discarded. The sync payload's `data` object has a new `deleted` array of `{id, type}` entries (`id` = the deleted sample's UUID, `type` = the HK type identifier of the query that reported it). **Server contract**: for each tombstone, delete the stored record whose id equals `id` and any records whose `parentId` equals `id`. Matches the Android SDK 0.12.0 payload change.
+  - Deletion-only pages now advance and persist the anchor correctly (previously a page containing only deletions was treated as "no data" and the tombstones were lost).
+  - Page-termination check now counts samples + deletions, matching what the query `limit` actually bounds.
+* **Full-export anchor baseline moved to export start**: the incremental anchor for each type is now captured *before* its first export page instead of at type completion. Anything written or deleted while a (possibly multi-hour) initial export runs is replayed by the first incremental sync — previously the completion-time baseline silently skipped mid-export writes and permanently lost tombstones for samples deleted during the export (including ones the export had already uploaded). Overlap re-delivery is absorbed by server upsert-by-id.
+
 ## 0.13.0
 
 * **Sync telemetry**: new `/logs` endpoint integration for initial full sync diagnostics.

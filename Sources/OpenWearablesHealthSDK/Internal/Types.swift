@@ -173,7 +173,7 @@ public enum HealthDataType: String, CaseIterable, Sendable {
 extension OpenWearablesHealthSDK {
 
     // MARK: - Public API
-    internal func serialize(samples: [HKSample], type: HKSampleType) -> [String: Any] {
+    internal func serialize(samples: [HKSample], type: HKSampleType, deleted: [[String: Any]] = []) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -215,13 +215,14 @@ extension OpenWearablesHealthSDK {
             "data": [
                 "workouts": workouts,
                 "records": records,
-                "sleep": sleep
+                "sleep": sleep,
+                "deleted": deleted
             ]
         ]
     }
-    
+
     // MARK: - Memory-efficient streaming serialization
-    internal func serializeCombinedStreaming(samples: [HKSample]) -> [String: Any] {
+    internal func serializeCombinedStreaming(samples: [HKSample], deleted: [[String: Any]] = []) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -272,11 +273,12 @@ extension OpenWearablesHealthSDK {
             "data": [
                 "workouts": workouts,
                 "records": records,
-                "sleep": sleep
+                "sleep": sleep,
+                "deleted": deleted
             ]
         ]
     }
-    
+
     // MARK: - Combined serialization (legacy)
     internal func serializeCombined(samples: [HKSample], anchors: [String: HKQueryAnchor]) -> [String: Any] {
         var workouts: [[String: Any]] = []
