@@ -903,6 +903,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private class RoundRobinState {
         var olderThanCursors: [String: Date] = [:]
         var anchorCursors: [String: HKQueryAnchor] = [:]
+        /// Full export only: per-type anchor captured BEFORE the type's first page.
+        /// Persisted as the pending anchor each round and saved durably at type
+        /// completion, so the first incremental sync replays everything written or
+        /// deleted while the (possibly multi-hour) export ran.
+        var capturedAnchorData: [String: Data] = [:]
         var completedTypes: Set<String> = []
         var round = 0
         var totalItemsSent = 0
@@ -947,7 +952,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
         }
         
-        if !fullExport {
+        if fullExport {
+            // Resumed exports restore their pre-captured baselines (persisted as the
+            // pending anchor data) so they are not re-captured mid-export.
+            rrState.capturedAnchorData = resumeInfo.anchorDataCursors
+        } else {
             let fullDone = defaults.bool(forKey: fullDoneKey())
             for type in types where !rrState.completedTypes.contains(type.identifier) && rrState.anchorCursors[type.identifier] == nil {
                 if let anchor = loadAnchor(for: type) {
@@ -970,6 +979,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private struct TypeRoundResult {
         let type: HKSampleType
         let samples: [HKSample]
+        /// Deletion tombstones ({id, type}) reported by the anchored query.
+        let deleted: [[String: Any]]
         let count: Int
         let nextOlderThan: Date?
         let newAnchor: HKQueryAnchor?
@@ -987,7 +998,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private struct PendingRound {
         let withData: [TypeRoundResult]
         let emptyDone: [TypeRoundResult]
-        let anchorCaptureTypes: [HKSampleType]
         let itemCount: Int
         let prepared: PreparedUpload?
         let roundIndex: Int
@@ -1048,16 +1058,17 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 }
             }
 
-            let withData = results.filter { !$0.samples.isEmpty }
+            let withData = results.filter { !$0.samples.isEmpty || !$0.deleted.isEmpty }
             let allSamples = withData.flatMap { $0.samples }
+            let allDeleted = withData.flatMap { $0.deleted }
 
             // Serialize and compress here too, so the round's whole CPU cost
             // rides along with the prefetch, hidden under the previous upload.
             var prepared: PreparedUpload? = nil
             var mapMs = 0
-            if !allSamples.isEmpty {
+            if !allSamples.isEmpty || !allDeleted.isEmpty {
                 let mapStart = Date()
-                let payload = self.buildCombinedPayload(samples: allSamples)
+                let payload = self.buildCombinedPayload(samples: allSamples, deleted: allDeleted)
                 mapMs = Int(Date().timeIntervalSince(mapStart) * 1000)
                 guard let upload = self.prepareUpload(payload: payload) else {
                     completion(false, nil)
@@ -1068,9 +1079,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
             let round = PendingRound(
                 withData: withData,
-                emptyDone: results.filter { $0.samples.isEmpty && $0.isDone },
-                anchorCaptureTypes: fullExport ? results.filter { $0.isDone }.map { $0.type } : [],
-                itemCount: allSamples.count,
+                emptyDone: results.filter { $0.samples.isEmpty && $0.deleted.isEmpty && $0.isDone },
+                itemCount: allSamples.count + allDeleted.count,
                 prepared: prepared,
                 roundIndex: roundIndex,
                 fetchMs: fetchMs,
@@ -1082,36 +1092,58 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
     /// Durably records a round's progress. Called only after the round's
     /// upload succeeded (or immediately for rounds that carried no data).
-    /// Calls back with false when a full-export anchor capture failed.
+    /// Calls back with false when a full-export type finished without a
+    /// captured baseline anchor.
     private func commitRound(
         _ round: PendingRound, fullExport: Bool, rrState: RoundRobinState,
         completion: @escaping (Bool) -> Void
     ) {
-        if !fullExport {
-            for result in round.emptyDone {
-                updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: result.anchorData)
-            }
+        var missingBaseline = false
+
+        // Without a baseline anchor a full-export type must NOT be marked complete:
+        // the next incremental sync would run an anchored query from nil and re-crawl
+        // the whole history oldest-first. Pause the sync instead - on resume the type
+        // re-sends its last chunk (deduplicated server-side) and retries the capture.
+        func completesType(_ result: TypeRoundResult) -> Bool {
+            guard result.isDone else { return false }
+            guard fullExport else { return true }
+            if rrState.capturedAnchorData[result.type.identifier] != nil { return true }
+            logMessage("  \(shortTypeName(result.type.identifier)): no baseline anchor - leaving type incomplete, pausing sync")
+            missingBaseline = true
+            return false
+        }
+
+        for result in round.emptyDone {
+            let isComplete = completesType(result)
+            updateTypeProgress(
+                typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: isComplete,
+                anchorData: fullExport ? rrState.capturedAnchorData[result.type.identifier] : result.anchorData
+            )
+            if fullExport && isComplete { fireTypeCompletedLog(result.type.identifier) }
         }
 
         for result in round.withData {
+            let isComplete = completesType(result)
             if fullExport {
+                // The anchor persisted here is the baseline captured BEFORE the type's
+                // first page — never one captured at completion, which would baseline
+                // past everything written or deleted while the export ran.
                 updateTypeProgress(
                     typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                    isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
+                    isComplete: isComplete,
+                    anchorData: rrState.capturedAnchorData[result.type.identifier],
+                    olderThan: result.nextOlderThan
                 )
+                if isComplete { fireTypeCompletedLog(result.type.identifier) }
             } else {
                 updateTypeProgress(
                     typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                    isComplete: result.isDone, anchorData: result.anchorData
+                    isComplete: isComplete, anchorData: result.anchorData
                 )
             }
         }
 
-        if fullExport && !round.anchorCaptureTypes.isEmpty {
-            captureAnchorsForDoneTypes(types: round.anchorCaptureTypes, index: 0, rrState: rrState, completion: completion)
-        } else {
-            completion(true)
-        }
+        completion(!missingBaseline)
     }
 
     /// Pipelined round loop: uploads `current` while prefetching the next
@@ -1236,30 +1268,50 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         if fullExport {
             let cursor = rrState.olderThanCursors[type.identifier]
-            fetchOneChunkNewestFirst(type: type, olderThan: cursor, chunkLimit: chunkLimit, generation: rrState.generation) {
-                [weak self] success, samples, nextOlderThan, isDone in
+            let fetchPage: () -> Void = { [weak self] in
                 guard let self = self else { completion(false, accumulated); return }
-                if !success { completion(false, accumulated); return }
-                
-                let result = TypeRoundResult(
-                    type: type, samples: samples, count: samples.count,
-                    nextOlderThan: nextOlderThan, newAnchor: nil, anchorData: nil, isDone: isDone
-                )
-                self.fetchTypesInRound(
-                    types: types, index: index + 1, fullExport: fullExport,
-                    chunkLimit: chunkLimit, rrState: rrState,
-                    accumulated: accumulated + [result], completion: completion
-                )
+                self.fetchOneChunkNewestFirst(type: type, olderThan: cursor, chunkLimit: chunkLimit, generation: rrState.generation) {
+                    [weak self] success, samples, nextOlderThan, isDone in
+                    guard let self = self else { completion(false, accumulated); return }
+                    if !success { completion(false, accumulated); return }
+
+                    let result = TypeRoundResult(
+                        type: type, samples: samples, deleted: [], count: samples.count,
+                        nextOlderThan: nextOlderThan, newAnchor: nil, anchorData: nil, isDone: isDone
+                    )
+                    self.fetchTypesInRound(
+                        types: types, index: index + 1, fullExport: fullExport,
+                        chunkLimit: chunkLimit, rrState: rrState,
+                        accumulated: accumulated + [result], completion: completion
+                    )
+                }
+            }
+
+            if rrState.capturedAnchorData[type.identifier] == nil {
+                // Capture the incremental baseline BEFORE the export reads this type.
+                // A baseline captured at completion would skip everything written or
+                // deleted while the export ran — including tombstones for samples the
+                // export itself already uploaded. Retried next round if it fails.
+                captureCurrentAnchor(for: type) { [weak self] anchor in
+                    guard self != nil else { completion(false, accumulated); return }
+                    if let anchor = anchor,
+                       let data = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) {
+                        rrState.capturedAnchorData[type.identifier] = data
+                    }
+                    fetchPage()
+                }
+            } else {
+                fetchPage()
             }
         } else {
             let anchor = rrState.anchorCursors[type.identifier]
             fetchOneChunkIncremental(type: type, anchor: anchor, chunkLimit: chunkLimit, generation: rrState.generation) {
-                [weak self] success, samples, newAnchor, anchorData, isDone in
+                [weak self] success, samples, deleted, newAnchor, anchorData, isDone in
                 guard let self = self else { completion(false, accumulated); return }
                 if !success { completion(false, accumulated); return }
                 
                 let result = TypeRoundResult(
-                    type: type, samples: samples, count: samples.count,
+                    type: type, samples: samples, deleted: deleted, count: samples.count + deleted.count,
                     nextOlderThan: nil, newAnchor: newAnchor, anchorData: anchorData, isDone: isDone
                 )
                 self.fetchTypesInRound(
@@ -1268,44 +1320,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                     accumulated: accumulated + [result], completion: completion
                 )
             }
-        }
-    }
-    
-    // MARK: - Capture anchors for completed full-export types
-    
-    private func captureAnchorsForDoneTypes(
-        types: [HKSampleType], index: Int, rrState: RoundRobinState,
-        completion: @escaping (Bool) -> Void
-    ) {
-        guard index < types.count else {
-            completion(true)
-            return
-        }
-        
-        let type = types[index]
-        captureCurrentAnchor(for: type) { [weak self] anchor in
-            guard let self = self else { completion(false); return }
-            if self.isSyncCancelled(generation: rrState.generation) {
-                completion(false)
-                return
-            }
-            
-            // Without a valid anchor the type must NOT be marked complete: the next
-            // incremental sync would run an anchored query from nil and re-crawl the
-            // whole history oldest-first. Pause the sync instead - on resume the type
-            // re-sends its last chunk (deduplicated server-side) and retries capture.
-            guard let anchor = anchor,
-                  let anchorData = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) else {
-                self.logMessage("  \(self.shortTypeName(type.identifier)): anchor capture failed - leaving type incomplete, pausing sync")
-                completion(false)
-                return
-            }
-            
-            self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: anchorData)
-            rrState.completedTypes.insert(type.identifier)
-            self.fireTypeCompletedLog(type.identifier)
-            self.logMessage("  \(self.shortTypeName(type.identifier)): complete (anchor captured)")
-            self.captureAnchorsForDoneTypes(types: types, index: index + 1, rrState: rrState, completion: completion)
         }
     }
     
@@ -1365,9 +1379,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     private func fetchOneChunkIncremental(
         type: HKSampleType, anchor: HKQueryAnchor?, chunkLimit: Int, generation: Int,
-        completion: @escaping (_ success: Bool, _ samples: [HKSample], _ newAnchor: HKQueryAnchor?, _ anchorData: Data?, _ isDone: Bool) -> Void
+        completion: @escaping (_ success: Bool, _ samples: [HKSample], _ deleted: [[String: Any]], _ newAnchor: HKQueryAnchor?, _ anchorData: Data?, _ isDone: Bool) -> Void
     ) {
-        if isSyncCancelled(generation: generation) { completion(false, [], nil, nil, false); return }
+        if isSyncCancelled(generation: generation) { completion(false, [], [], nil, nil, false); return }
         
         let syncPredicate: NSPredicate? = {
             guard let start = syncStartDate() else { return nil }
@@ -1377,24 +1391,25 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkLimit) {
             [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
             autoreleasepool {
-                guard let self = self else { completion(false, [], nil, nil, false); return }
+                guard let self = self else { completion(false, [], [], nil, nil, false); return }
                 
-                if self.isSyncCancelled(generation: generation) { completion(false, [], nil, nil, false); return }
+                if self.isSyncCancelled(generation: generation) { completion(false, [], [], nil, nil, false); return }
                 
                 if let error = error {
                     if self.isProtectedDataError(error) {
                         self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible - pausing sync")
                         self.pendingSyncAfterUnlock = true
-                        completion(false, [], nil, nil, false)
+                        completion(false, [], [], nil, nil, false)
                         return
                     }
                     self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
-                    completion(true, [], nil, nil, true)
+                    completion(true, [], [], nil, nil, true)
                     return
                 }
                 
                 let samples = samplesOrNil ?? []
-                let deletedCount = deletedObjects?.count ?? 0
+                let deleted = self.mapDeletedObjects(deletedObjects, type: type)
+                let deletedCount = deleted.count
                 
                 var anchorData: Data? = nil
                 if let newAnchor = newAnchor {
@@ -1403,7 +1418,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 
                 if samples.isEmpty && deletedCount == 0 {
                     self.logMessage("  \(self.shortTypeName(type.identifier)): complete")
-                    completion(true, [], newAnchor, anchorData, true)
+                    completion(true, [], [], newAnchor, anchorData, true)
                     return
                 }
                 
@@ -1412,11 +1427,19 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 // for the remaining (unfetched) data was never advanced.
                 let isLastChunk = (samples.count + deletedCount) < chunkLimit
                 self.logMessage("  \(self.shortTypeName(type.identifier)): \(samples.count) samples" + (deletedCount > 0 ? ", \(deletedCount) deleted" : ""))
-                completion(true, samples, newAnchor, anchorData, isLastChunk)
+                completion(true, samples, deleted, newAnchor, anchorData, isLastChunk)
             }
         }
         
         healthStore.execute(query)
+    }
+
+    /// Maps HealthKit deletion tombstones to payload entries. The server deletes the
+    /// stored record with this id and any records whose parentId equals it.
+    internal func mapDeletedObjects(_ deletedObjects: [HKDeletedObject]?, type: HKSampleType) -> [[String: Any]] {
+        return (deletedObjects ?? []).map {
+            ["id": $0.uuid.uuidString, "type": type.identifier]
+        }
     }
     
     // MARK: - Anchor Capture (for incremental sync after full export)

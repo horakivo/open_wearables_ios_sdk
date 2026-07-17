@@ -240,7 +240,7 @@ extension OpenWearablesHealthSDK {
     /// handed to `JSONSerialization` in one piece, so peak memory scales with the round.
     /// It is bounded by the round size instead - background rounds carry 100 records
     /// (~65 KB), and the 2000-record rounds only run in the foreground.
-    internal func buildCombinedPayload(samples: [HKSample]) -> [String: Any] {
+    internal func buildCombinedPayload(samples: [HKSample], deleted: [[String: Any]] = []) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -291,7 +291,8 @@ extension OpenWearablesHealthSDK {
             "data": [
                 "workouts": workouts,
                 "records": records,
-                "sleep": sleep
+                "sleep": sleep,
+                "deleted": deleted
             ]
         ]
         // Backend already reads these (`body.get`); without them the batch is treated as
