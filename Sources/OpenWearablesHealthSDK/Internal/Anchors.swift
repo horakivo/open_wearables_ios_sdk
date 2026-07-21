@@ -42,6 +42,44 @@ extension OpenWearablesHealthSDK {
             defaults.removeObject(forKey: anchorKey(for: t))
         }
         defaults.set(false, forKey: fullDoneKey())
+        defaults.removeObject(forKey: syncGenerationKey())
+    }
+
+    // MARK: - Sync generation
+
+    // The server's per-user data generation, echoed on every sync response. It is
+    // bumped server-side when the user's synced data is deleted; a change means
+    // every local cursor points into a dataset that no longer exists. Stored with
+    // the same lifecycle as the anchors it validates (cleared in resetAllAnchors).
+    internal func syncGenerationKey() -> String {
+        "syncGeneration.\(userKey())"
+    }
+
+    internal func loadSyncGeneration() -> Int? {
+        defaults.object(forKey: syncGenerationKey()) as? Int
+    }
+
+    internal func saveSyncGeneration(_ value: Int) {
+        defaults.set(value, forKey: syncGenerationKey())
+    }
+
+    /// Applies a generation observed on an upload response. Returns true when the
+    /// generation changed (server-side data was reset): anchors and the sync session
+    /// are cleared and the caller must restart as a full export. A first-seen value
+    /// is adopted silently — "nothing stored" must never count as a mismatch, or
+    /// every fresh sign-in would trigger a second, redundant full export.
+    internal func applyServerSyncGeneration(_ serverGeneration: Int?) -> Bool {
+        guard let serverGeneration = serverGeneration else { return false }
+        guard let known = loadSyncGeneration() else {
+            saveSyncGeneration(serverGeneration)
+            return false
+        }
+        if known == serverGeneration { return false }
+        logMessage("Sync generation changed (\(known) -> \(serverGeneration)): server-side data was reset")
+        resetAllAnchors()
+        clearSyncSession()
+        saveSyncGeneration(serverGeneration)
+        return true
     }
 
     // MARK: - Initial sync

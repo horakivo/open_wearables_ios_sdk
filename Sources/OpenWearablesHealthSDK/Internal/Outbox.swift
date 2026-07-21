@@ -182,6 +182,16 @@ extension OpenWearablesHealthSDK {
                 if (200...299).contains(httpResponse.statusCode) {
                     self.logMessage("HTTP \(httpResponse.statusCode) (network \(networkMs)ms, \(prepared.rawByteCount / 1024) KB -> \(prepared.body.count / 1024) KB)")
 
+                    if self.applyServerSyncGeneration(self.parseSyncGeneration(from: data)) {
+                        // Server data was reset: cursors are already cleared, so do NOT
+                        // commit this upload's progress — abort and let the sync re-drive
+                        // itself as a full export once it unwinds.
+                        self.generationResetPending = true
+                        try? FileManager.default.removeItem(atPath: prepared.payloadPath)
+                        completion(false)
+                        return
+                    }
+
                     self.handleSuccessfulUpload(itemPath: prepared.itemPath, anchorPath: nil, wasFullExport: false)
 
                     try? FileManager.default.removeItem(atPath: prepared.payloadPath)
@@ -224,6 +234,15 @@ extension OpenWearablesHealthSDK {
         task.resume()
     }
     
+    /// Reads the server's per-user sync generation from a successful sync response.
+    /// Absent on older backends; nil means "no signal", never "reset".
+    internal func parseSyncGeneration(from data: Data?) -> Int? {
+        guard let data = data, !data.isEmpty,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj["sync_generation"] as? Int
+    }
+
     /// Handles 401 response for combined uploads.
     private func handle401ForUpload(
         payloadData: Data,
