@@ -162,6 +162,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // Sync flags
     internal var isInitialSyncInProgress = false
     private var isSyncing: Bool = false
+    // Set when an upload response reports a changed server sync generation; the
+    // aborted sync re-drives itself as a full export once it unwinds.
+    internal var serverGenerationResetPending = false
     private let syncLock = NSLock()
     internal var fullSyncStartTime: Date?
     
@@ -875,6 +878,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 self.logMessage(String(format: "Sync finished in %.1fs (allTypesCompleted: %@)", totalSeconds, String(allTypesCompleted)))
                 self.fullSyncStartTime = nil
                 self.finishSync(generation: generation)
+
+                // Server-side data reset detected mid-run: cursors and session are
+                // already cleared (applyServerSyncGeneration), re-drive once as a
+                // full export now that the sync slot has been released.
+                if self.serverGenerationResetPending {
+                    self.serverGenerationResetPending = false
+                    self.logMessage("Restarting as full export (server data reset)")
+                    self.syncAll(fullExport: true) { }
+                }
+
                 completion()
             }
         }

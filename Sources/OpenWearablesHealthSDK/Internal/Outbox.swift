@@ -134,6 +134,16 @@ extension OpenWearablesHealthSDK {
             
             if OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: statusCode) {
                 self.logMessage("HTTP \(statusCode) (network \(networkMs)ms, \(prepared.rawByteCount / 1024) KB -> \(prepared.body.count / 1024) KB)")
+
+                if self.applyServerSyncGeneration(self.parseServerSyncGeneration(from: data)) {
+                    // Server data was reset: cursors are already cleared, so do NOT
+                    // commit this upload's progress — abort and let the sync re-drive
+                    // itself as a full export once it unwinds.
+                    self.serverGenerationResetPending = true
+                    completion(false)
+                    return
+                }
+
                 completion(true)
                 return
             }
@@ -162,6 +172,15 @@ extension OpenWearablesHealthSDK {
         task.resume()
     }
     
+    /// Reads the server's per-user sync generation from a successful sync response.
+    /// Absent on older backends; nil means "no signal", never "reset".
+    internal func parseServerSyncGeneration(from data: Data?) -> Int? {
+        guard let data = data, !data.isEmpty,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj["sync_generation"] as? Int
+    }
+
     /// Handles 401 response for combined uploads. The retry reuses `requestId` so both
     /// attempts are one story in the server-side logs.
     private func handle401ForUpload(
