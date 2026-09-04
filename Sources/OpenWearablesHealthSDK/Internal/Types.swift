@@ -17,6 +17,8 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case steps
     case distanceWalkingRunning
     case distanceCycling
+    case distanceSwimming
+    case swimmingStrokeCount
     case flightsClimbed
     case walkingSpeed
     case walkingStepLength
@@ -69,6 +71,7 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     
     // Running Dynamics (iOS 16.0+) — sensor-derived, not computable from distance/steps
     case runningPower
+    case runningSpeed
     case runningVerticalOscillation
     case runningGroundContactTime
 
@@ -99,6 +102,10 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning)
         case .distanceCycling:
             return HKObjectType.quantityType(forIdentifier: .distanceCycling)
+        case .distanceSwimming:
+            return HKObjectType.quantityType(forIdentifier: .distanceSwimming)
+        case .swimmingStrokeCount:
+            return HKObjectType.quantityType(forIdentifier: .swimmingStrokeCount)
         case .flightsClimbed:
             return HKObjectType.quantityType(forIdentifier: .flightsClimbed)
         case .walkingSpeed:
@@ -182,6 +189,11 @@ public enum HealthDataType: String, CaseIterable, Sendable {
         case .runningPower:
             if #available(iOS 16.0, *) {
                 return HKObjectType.quantityType(forIdentifier: .runningPower)
+            }
+            return nil
+        case .runningSpeed:
+            if #available(iOS 16.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .runningSpeed)
             }
             return nil
         case .runningVerticalOscillation:
@@ -325,7 +337,8 @@ extension OpenWearablesHealthSDK {
              HKObjectType.quantityType(forIdentifier: .restingHeartRate):
             return .count().unitDivided(by: .minute())
         case HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning),
-             HKObjectType.quantityType(forIdentifier: .distanceCycling):
+             HKObjectType.quantityType(forIdentifier: .distanceCycling),
+             HKObjectType.quantityType(forIdentifier: .distanceSwimming):
             return .meter()
         case HKObjectType.quantityType(forIdentifier: .bodyMass),
              HKObjectType.quantityType(forIdentifier: .height):
@@ -343,6 +356,9 @@ extension OpenWearablesHealthSDK {
             if #available(iOS 16.0, *) {
                 if qt == HKObjectType.quantityType(forIdentifier: .runningPower) {
                     return .watt()
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .runningSpeed) {
+                    return .meter().unitDivided(by: .second())
                 }
                 if qt == HKObjectType.quantityType(forIdentifier: .runningVerticalOscillation) {
                     return .meterUnit(with: .centi)
@@ -388,8 +404,11 @@ extension OpenWearablesHealthSDK {
              HKObjectType.quantityType(forIdentifier: .dietaryEnergyConsumed):
             return (.kilocalorie(), "Cal")
         case HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning),
-             HKObjectType.quantityType(forIdentifier: .distanceCycling):
+             HKObjectType.quantityType(forIdentifier: .distanceCycling),
+             HKObjectType.quantityType(forIdentifier: .distanceSwimming):
             return (.meter(), "m")
+        case HKObjectType.quantityType(forIdentifier: .swimmingStrokeCount):
+            return (.count(), "count")
         case HKObjectType.quantityType(forIdentifier: .walkingSpeed):
             return (.meter().unitDivided(by: .second()), "m/s")
         case HKObjectType.quantityType(forIdentifier: .walkingStepLength):
@@ -442,6 +461,9 @@ extension OpenWearablesHealthSDK {
             if #available(iOS 16.0, *) {
                 if qt == HKObjectType.quantityType(forIdentifier: .runningPower) {
                     return (.watt(), "W")
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .runningSpeed) {
+                    return (.meter().unitDivided(by: .second()), "m/s")
                 }
                 if qt == HKObjectType.quantityType(forIdentifier: .runningVerticalOscillation) {
                     return (.meterUnit(with: .centi), "cm")
