@@ -17,6 +17,7 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case steps
     case distanceWalkingRunning
     case distanceCycling
+    case distanceSwimming
     case flightsClimbed
     case walkingSpeed
     case walkingStepLength
@@ -25,6 +26,14 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case sixMinuteWalkTestDistance
     case activeEnergy
     case basalEnergy
+
+    // Workout samples (bound to workouts server-side by time window + source)
+    case swimmingStrokeCount
+    case runningSpeed
+    case runningPower
+    case cyclingSpeed
+    case cyclingPower
+    case cyclingCadence
     
     // Heart & Cardiovascular
     case heartRate
@@ -84,6 +93,35 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning)
         case .distanceCycling:
             return HKObjectType.quantityType(forIdentifier: .distanceCycling)
+        case .distanceSwimming:
+            return HKObjectType.quantityType(forIdentifier: .distanceSwimming)
+        case .swimmingStrokeCount:
+            return HKObjectType.quantityType(forIdentifier: .swimmingStrokeCount)
+        case .runningSpeed:
+            if #available(iOS 16.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .runningSpeed)
+            }
+            return nil
+        case .runningPower:
+            if #available(iOS 16.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .runningPower)
+            }
+            return nil
+        case .cyclingSpeed:
+            if #available(iOS 17.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .cyclingSpeed)
+            }
+            return nil
+        case .cyclingPower:
+            if #available(iOS 17.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .cyclingPower)
+            }
+            return nil
+        case .cyclingCadence:
+            if #available(iOS 17.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .cyclingCadence)
+            }
+            return nil
         case .flightsClimbed:
             return HKObjectType.quantityType(forIdentifier: .flightsClimbed)
         case .walkingSpeed:
@@ -464,7 +502,8 @@ extension OpenWearablesHealthSDK {
              HKObjectType.quantityType(forIdentifier: .restingHeartRate):
             return .count().unitDivided(by: .minute())
         case HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning),
-             HKObjectType.quantityType(forIdentifier: .distanceCycling):
+             HKObjectType.quantityType(forIdentifier: .distanceCycling),
+             HKObjectType.quantityType(forIdentifier: .distanceSwimming):
             return .meter()
         case HKObjectType.quantityType(forIdentifier: .bodyMass),
              HKObjectType.quantityType(forIdentifier: .height):
@@ -498,8 +537,11 @@ extension OpenWearablesHealthSDK {
              HKObjectType.quantityType(forIdentifier: .dietaryEnergyConsumed):
             return (.kilocalorie(), "Cal")
         case HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning),
-             HKObjectType.quantityType(forIdentifier: .distanceCycling):
+             HKObjectType.quantityType(forIdentifier: .distanceCycling),
+             HKObjectType.quantityType(forIdentifier: .distanceSwimming):
             return (.meter(), "m")
+        case HKObjectType.quantityType(forIdentifier: .swimmingStrokeCount):
+            return (.count(), "count")
         case HKObjectType.quantityType(forIdentifier: .walkingSpeed):
             return (.meter().unitDivided(by: .second()), "m/s")
         case HKObjectType.quantityType(forIdentifier: .walkingStepLength):
@@ -542,6 +584,16 @@ extension OpenWearablesHealthSDK {
             return (vo2Unit, "mL/kg/min")
         case HKObjectType.quantityType(forIdentifier: .flightsClimbed):
             return (.count(), "count")
+        case _ where _isWorkoutSpeedType(qt):
+            return (.meter().unitDivided(by: .second()), "m/s")
+        case _ where _isWorkoutPowerType(qt):
+            // Power identifiers exist only on iOS 16+, so this branch is unreachable below it.
+            if #available(iOS 16.0, *) {
+                return (.watt(), "W")
+            }
+            return (.count(), "count")
+        case _ where _isWorkoutCadenceType(qt):
+            return (.count().unitDivided(by: .minute()), "count/min")
         case HKObjectType.quantityType(forIdentifier: .dietaryCarbohydrates),
              HKObjectType.quantityType(forIdentifier: .dietaryProtein),
              HKObjectType.quantityType(forIdentifier: .dietaryFatTotal):
@@ -551,6 +603,25 @@ extension OpenWearablesHealthSDK {
         default:
             return (.count(), "count")
         }
+    }
+
+    // Identifiers introduced in iOS 16/17: matched by availability so the unit switch above stays
+    // exhaustive on older systems (these types are never queried there, see toHKSampleType).
+    private func _isWorkoutSpeedType(_ qt: HKQuantityType) -> Bool {
+        if #available(iOS 16.0, *), qt == HKObjectType.quantityType(forIdentifier: .runningSpeed) { return true }
+        if #available(iOS 17.0, *), qt == HKObjectType.quantityType(forIdentifier: .cyclingSpeed) { return true }
+        return false
+    }
+
+    private func _isWorkoutPowerType(_ qt: HKQuantityType) -> Bool {
+        if #available(iOS 16.0, *), qt == HKObjectType.quantityType(forIdentifier: .runningPower) { return true }
+        if #available(iOS 17.0, *), qt == HKObjectType.quantityType(forIdentifier: .cyclingPower) { return true }
+        return false
+    }
+
+    private func _isWorkoutCadenceType(_ qt: HKQuantityType) -> Bool {
+        if #available(iOS 17.0, *), qt == HKObjectType.quantityType(forIdentifier: .cyclingCadence) { return true }
+        return false
     }
 
     internal func _workoutTypeString(_ t: HKWorkoutActivityType) -> String {

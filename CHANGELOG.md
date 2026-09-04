@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.0
+
+* **Workout sample types**: new `HealthDataType` cases `distanceSwimming`, `swimmingStrokeCount`, `runningSpeed` (iOS 16+), `runningPower` (iOS 16+), `cyclingSpeed`, `cyclingPower` and `cyclingCadence` (iOS 17+). They sync as plain samples under their HealthKit identifiers (`HKQuantityTypeIdentifierRunningSpeed` etc.) with units `m`, `count`, `m/s`, `W`, `count/min`; on systems that predate an identifier the type resolves to `nil` and is skipped. The server binds these samples to the workout they fall in by time window + source and sums them on read, so the workout's own `distance` / `activeEnergyBurned` / `swimmingStrokeCount` statistics are no longer authoritative there (they are still sent).
+
 ## 0.14.0
 
 * **Deletion propagation**: samples deleted from HealthKit are now reported to the server. The anchored queries used for incremental sync already receive `HKDeletedObject` tombstones; they were previously discarded. The sync payload's `data` object has a new `deleted` array of `{id, type}` entries (`id` = the deleted sample's UUID, `type` = the HK type identifier of the query that reported it). **Server contract**: for each tombstone, delete the stored record whose id equals `id` and any records whose `parentId` equals `id`. Matches the Android SDK 0.12.0 payload change.
