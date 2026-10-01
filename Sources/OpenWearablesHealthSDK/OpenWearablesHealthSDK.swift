@@ -152,7 +152,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal var foregroundSession: URLSession!
     internal var trackedTypes: [HKSampleType] = []
     internal var backgroundChunkSize: Int = 100
-    internal var recordsPerChunk: Int = 2000
+    internal var recordsPerChunk: Int = 8000
     
     // Debouncing
     private var pendingSyncWorkItem: DispatchWorkItem?
@@ -871,6 +871,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 } else {
                     self.logMessage("Sync incomplete - will resume remaining types later")
                 }
+                let totalSeconds = Date().timeIntervalSince(syncStartTime)
+                self.logMessage(String(format: "Sync finished in %.1fs (allTypesCompleted: %@)", totalSeconds, String(allTypesCompleted)))
                 self.fullSyncStartTime = nil
                 self.finishSync(generation: generation)
                 completion()
@@ -902,6 +904,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         var olderThanCursors: [String: Date] = [:]
         var anchorCursors: [String: HKQueryAnchor] = [:]
         var completedTypes: Set<String> = []
+        var round = 0
+        var totalItemsSent = 0
         /// Sync run this state belongs to, so late callbacks can tell whether they are stale.
         let generation: Int
         /// Whether the caller already knows it runs in the background (BG tasks do).
@@ -955,9 +959,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
         }
         
-        processNextRound(
+        pipelineRounds(
             types: types, fullExport: fullExport, endpoint: endpoint,
-            rrState: rrState, completion: completion
+            rrState: rrState, current: nil, completion: completion
         )
     }
     
@@ -973,149 +977,244 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let isDone: Bool
     }
     
-    // MARK: - Round-Robin with combined payloads
-    
-    private func processNextRound(
-        types: [HKSampleType], fullExport: Bool, endpoint: URL,
+    // MARK: - Round-Robin with combined payloads, pipelined read + upload
+
+    /// One fetched, serialized, compressed round awaiting upload/commit.
+    /// Session-local cursors and completions in `RoundRobinState` already
+    /// reflect it, so the next round can be prefetched while this one uploads;
+    /// durable progress is written only in `commitRound` after the upload
+    /// succeeds.
+    private struct PendingRound {
+        let withData: [TypeRoundResult]
+        let emptyDone: [TypeRoundResult]
+        let anchorCaptureTypes: [HKSampleType]
+        let itemCount: Int
+        let prepared: PreparedUpload?
+        let roundIndex: Int
+        let fetchMs: Int
+        let mapMs: Int
+    }
+
+    /// Fetches one round from HealthKit and advances session-local cursors.
+    /// Calls back with (true, nil) when every type is already complete.
+    private func fetchRound(
+        types: [HKSampleType], fullExport: Bool,
         rrState: RoundRobinState,
-        completion: @escaping (Bool) -> Void
+        completion: @escaping (Bool, PendingRound?) -> Void
     ) {
         if isSyncCancelled(generation: rrState.generation) {
             logMessage("Sync cancelled - stopping round-robin")
-            completion(false)
+            completion(false, nil)
             return
         }
-        
+
         let incompleteTypes = types.filter { !rrState.completedTypes.contains($0.identifier) }
         if incompleteTypes.isEmpty {
-            completion(true)
+            completion(true, nil)
             return
         }
-        
+
         let chunkLimit = currentChunkLimit(declaredBackground: rrState.declaredBackground)
         let perTypeLimit = max(1, chunkLimit / incompleteTypes.count)
-        
-        // Phase 1: Fetch one chunk from each type (no network yet)
+
+        rrState.round += 1
+        let roundIndex = rrState.round
+        let fetchStart = Date()
+
         fetchTypesInRound(
             types: incompleteTypes, index: 0, fullExport: fullExport,
             chunkLimit: perTypeLimit, rrState: rrState, accumulated: []
         ) { [weak self] success, results in
-            guard let self = self else { completion(false); return }
-            if !success { completion(false); return }
+            guard let self = self else { completion(false, nil); return }
+            if !success { completion(false, nil); return }
             if self.isSyncCancelled(generation: rrState.generation) {
-                completion(false)
+                completion(false, nil)
                 return
             }
-            
-            // Update cursors for types that aren't done
-            for result in results where !result.isDone {
-                if fullExport {
+
+            let fetchMs = Int(Date().timeIntervalSince(fetchStart) * 1000)
+
+            // Session-local advancement only, so the next prefetch continues
+            // past this round even before its upload is confirmed. If the
+            // upload fails, this state is discarded and the resumed sync
+            // refetches from durable progress.
+            for result in results {
+                if result.isDone {
+                    rrState.completedTypes.insert(result.type.identifier)
+                } else if fullExport {
                     rrState.olderThanCursors[result.type.identifier] = result.nextOlderThan
                 } else if let anchor = result.newAnchor {
                     rrState.anchorCursors[result.type.identifier] = anchor
                 }
             }
-            
-            // Mark empty/done types (no data to send) as complete immediately
-            let emptyDone = results.filter { $0.samples.isEmpty && $0.isDone }
-            for result in emptyDone {
-                if !fullExport {
-                    self.updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: result.anchorData)
-                }
-                rrState.completedTypes.insert(result.type.identifier)
-                if fullExport { self.fireTypeCompletedLog(result.type.identifier) }
-            }
-            
-            // Phase 2: Build combined payload from all types that returned data
+
             let withData = results.filter { !$0.samples.isEmpty }
             let allSamples = withData.flatMap { $0.samples }
-            
-            let doneTypesForAnchorCapture = results.filter { $0.isDone }.map { $0.type }
-            
-            if allSamples.isEmpty {
-                if fullExport && !doneTypesForAnchorCapture.isEmpty {
-                    self.captureAnchorsForDoneTypes(types: doneTypesForAnchorCapture, index: 0, rrState: rrState) { captureOk in
-                        guard captureOk else { completion(false); return }
-                        self.processNextRound(
-                            types: types, fullExport: fullExport, endpoint: endpoint,
-                            rrState: rrState, completion: completion
-                        )
-                    }
-                } else {
-                    self.processNextRound(
-                        types: types, fullExport: fullExport, endpoint: endpoint,
-                        rrState: rrState, completion: completion
-                    )
-                }
-                return
-            }
-            
-            guard let freshCredential = self.authCredential else {
-                self.logMessage("No auth credential available for upload")
-                completion(false)
-                return
-            }
-            
-            // When the app runs in the background it lives on a ~30s task assertion.
-            // Don't start an upload that almost certainly cannot finish before
-            // expiration. The margin is deliberately small (a chunk upload takes
-            // ~1-3s) to use as much of the background window as possible: cursors
-            // and anchors only advance on a server 2xx, so even if the very last
-            // upload gets cut by expiration the batch is simply re-sent (and
-            // deduplicated server-side) when the sync resumes.
-            if let remaining = self.backgroundTimeRemainingIfInBackground(), remaining < 5 {
-                self.logMessage("Background time low (\(Int(remaining))s left) - pausing sync before next upload")
-                completion(false)
-                return
-            }
-            
-            let payload = self.buildCombinedPayload(samples: allSamples)
-            
-            self.uploadCombinedPayload(
-                payload: payload, endpoint: endpoint, credential: freshCredential,
-                generation: rrState.generation
-            ) { [weak self] sendSuccess in
-                guard let self = self else { completion(false); return }
-                if !sendSuccess { completion(false); return }
-                if self.isSyncCancelled(generation: rrState.generation) {
-                    completion(false)
+
+            // Serialize and compress here too, so the round's whole CPU cost
+            // rides along with the prefetch, hidden under the previous upload.
+            var prepared: PreparedUpload? = nil
+            var mapMs = 0
+            if !allSamples.isEmpty {
+                let mapStart = Date()
+                let payload = self.buildCombinedPayload(samples: allSamples)
+                mapMs = Int(Date().timeIntervalSince(mapStart) * 1000)
+                guard let upload = self.prepareUpload(payload: payload) else {
+                    completion(false, nil)
                     return
                 }
-                
-                // Phase 3: Update progress for all types that had data
-                for result in withData {
-                    if fullExport {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
-                        )
-                    } else {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: result.isDone, anchorData: result.anchorData
-                        )
-                        if result.isDone {
-                            rrState.completedTypes.insert(result.type.identifier)
-                        }
-                    }
-                }
-                
-                // Phase 4: For full export, capture anchors for done types
-                let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
-                if fullExport && !fullExportDone.isEmpty {
-                    self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
-                        guard captureOk else { completion(false); return }
-                        self.processNextRound(
-                            types: types, fullExport: fullExport, endpoint: endpoint,
-                            rrState: rrState, completion: completion
-                        )
-                    }
-                } else {
-                    self.processNextRound(
-                        types: types, fullExport: fullExport, endpoint: endpoint,
-                        rrState: rrState, completion: completion
-                    )
-                }
+                prepared = upload
+            }
+
+            let round = PendingRound(
+                withData: withData,
+                emptyDone: results.filter { $0.samples.isEmpty && $0.isDone },
+                anchorCaptureTypes: fullExport ? results.filter { $0.isDone }.map { $0.type } : [],
+                itemCount: allSamples.count,
+                prepared: prepared,
+                roundIndex: roundIndex,
+                fetchMs: fetchMs,
+                mapMs: mapMs
+            )
+            completion(true, round)
+        }
+    }
+
+    /// Durably records a round's progress. Called only after the round's
+    /// upload succeeded (or immediately for rounds that carried no data).
+    /// Calls back with false when a full-export anchor capture failed.
+    private func commitRound(
+        _ round: PendingRound, fullExport: Bool, rrState: RoundRobinState,
+        completion: @escaping (Bool) -> Void
+    ) {
+        if !fullExport {
+            for result in round.emptyDone {
+                updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: result.anchorData)
+            }
+        }
+
+        for result in round.withData {
+            if fullExport {
+                updateTypeProgress(
+                    typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                    isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
+                )
+            } else {
+                updateTypeProgress(
+                    typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                    isComplete: result.isDone, anchorData: result.anchorData
+                )
+            }
+        }
+
+        if fullExport && !round.anchorCaptureTypes.isEmpty {
+            captureAnchorsForDoneTypes(types: round.anchorCaptureTypes, index: 0, rrState: rrState, completion: completion)
+        } else {
+            completion(true)
+        }
+    }
+
+    /// Pipelined round loop: uploads `current` while prefetching the next
+    /// round from HealthKit, then commits `current` once its upload succeeds.
+    private func pipelineRounds(
+        types: [HKSampleType], fullExport: Bool, endpoint: URL,
+        rrState: RoundRobinState,
+        current: PendingRound?,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let current = current else {
+            // Nothing in hand (first round): fetch, then continue.
+            fetchRound(types: types, fullExport: fullExport, rrState: rrState) { [weak self] success, round in
+                guard let self = self else { completion(false); return }
+                if !success { completion(false); return }
+                guard let round = round else { completion(true); return }
+                self.pipelineRounds(
+                    types: types, fullExport: fullExport, endpoint: endpoint,
+                    rrState: rrState, current: round, completion: completion
+                )
+            }
+            return
+        }
+
+        // Rounds without data have no upload to overlap: commit and move on.
+        guard let prepared = current.prepared else {
+            commitRound(current, fullExport: fullExport, rrState: rrState) { [weak self] commitOk in
+                guard let self = self else { completion(false); return }
+                guard commitOk else { completion(false); return }
+                self.pipelineRounds(
+                    types: types, fullExport: fullExport, endpoint: endpoint,
+                    rrState: rrState, current: nil, completion: completion
+                )
+            }
+            return
+        }
+
+        guard let freshCredential = authCredential else {
+            logMessage("No auth credential available for upload")
+            completion(false)
+            return
+        }
+
+        // When the app runs in the background it lives on a ~30s task assertion.
+        // Don't start an upload that almost certainly cannot finish before
+        // expiration. The margin is deliberately small (a chunk upload takes
+        // ~1-3s) to use as much of the background window as possible: cursors
+        // and anchors only advance on a server 2xx, so even if the very last
+        // upload gets cut by expiration the batch is simply re-sent (and
+        // deduplicated server-side) when the sync resumes.
+        if let remaining = backgroundTimeRemainingIfInBackground(), remaining < 5 {
+            logMessage("Background time low (\(Int(remaining))s left) - pausing sync before next upload")
+            completion(false)
+            return
+        }
+
+        // Per-type counts are known from the fetch — no payload re-parse.
+        let breakdown = current.withData
+            .sorted { $0.count > $1.count }
+            .map { "\(shortTypeName($0.type.identifier)): \($0.count)" }
+            .joined(separator: ", ")
+        logMessage("Sending \(prepared.body.count / 1024) KB, \(current.itemCount) items (\(breakdown))")
+
+        let sendStart = Date()
+
+        let group = DispatchGroup()
+        var uploadOK = false
+        var prefetchOK = false
+        var nextRound: PendingRound?
+
+        group.enter()
+        sendPreparedUpload(prepared, endpoint: endpoint, credential: freshCredential, generation: rrState.generation) { sendSuccess in
+            uploadOK = sendSuccess
+            group.leave()
+        }
+
+        group.enter()
+        fetchRound(types: types, fullExport: fullExport, rrState: rrState) { success, round in
+            prefetchOK = success
+            nextRound = round
+            group.leave()
+        }
+
+        group.notify(queue: .global(qos: .utility)) { [weak self] in
+            guard let self = self else { completion(false); return }
+            if !uploadOK { completion(false); return }
+            if self.isSyncCancelled(generation: rrState.generation) {
+                completion(false)
+                return
+            }
+
+            let sendMs = Int(Date().timeIntervalSince(sendStart) * 1000)
+            rrState.totalItemsSent += current.itemCount
+            self.logMessage("Round \(current.roundIndex) timing: fetch \(current.fetchMs)ms, map \(current.mapMs)ms, prep \(prepared.encodeMs + prepared.gzipMs)ms, send \(sendMs)ms (\(current.itemCount) items, \(current.withData.count) types, total \(rrState.totalItemsSent))")
+
+            self.commitRound(current, fullExport: fullExport, rrState: rrState) { commitOk in
+                guard commitOk else { completion(false); return }
+                if !prefetchOK { completion(false); return }
+                guard let next = nextRound else { completion(true); return }
+                self.pipelineRounds(
+                    types: types, fullExport: fullExport, endpoint: endpoint,
+                    rrState: rrState, current: next, completion: completion
+                )
             }
         }
     }
@@ -1679,47 +1778,47 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     // MARK: - Payload Logging
-    
-    internal func logPayloadSummary(_ data: Data, label: String) {
-        // Building the summary re-parses the whole payload (~1.3 MB per round), so it
-        // must not run when the log line would be dropped anyway.
-        guard isLoggingEnabled else { return }
-        
-        let sizeKB = Double(data.count) / 1024
-        
-        guard let jsonObject = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
-              let dataDict = jsonObject["data"] as? [String: Any] else {
-            logMessage("\(label): \(String(format: "%.0f", sizeKB)) KB")
-            return
-        }
-        
-        var typeCounts: [String: Int] = [:]
-        
-        if let records = dataDict["records"] as? [[String: Any]] {
-            for record in records {
-                guard let type = record["type"] as? String else { continue }
-                let shortType = type
-                    .replacingOccurrences(of: "HKQuantityTypeIdentifier", with: "")
-                    .replacingOccurrences(of: "HKCategoryTypeIdentifier", with: "")
-                typeCounts[shortType, default: 0] += 1
-            }
-        }
-        if let sleep = dataDict["sleep"] as? [[String: Any]], !sleep.isEmpty {
-            typeCounts["sleep"] = sleep.count
-        }
-        if let workouts = dataDict["workouts"] as? [[String: Any]], !workouts.isEmpty {
-            typeCounts["workouts"] = workouts.count
-        }
-        
-        let totalCount = typeCounts.values.reduce(0, +)
-        let breakdown = typeCounts
-            .sorted { $0.value > $1.value }
-            .map { "\($0.key): \($0.value)" }
-            .joined(separator: ", ")
-        
-        logMessage("\(label) \(String(format: "%.0f", sizeKB)) KB, \(totalCount) items (\(breakdown))")
-    }
-    
+
+    // Unused since pre-serialization: the "Sending" breakdown is now built from
+    // per-type fetch counts in pipelineRounds, which avoids re-parsing the whole
+    // JSON payload (~17ms per round). Kept for debugging arbitrary payload Data.
+    //
+    // internal func logPayloadSummary(_ data: Data, label: String) {
+    //     let sizeKB = Double(data.count) / 1024
+    //
+    //     guard let jsonObject = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+    //           let dataDict = jsonObject["data"] as? [String: Any] else {
+    //         logMessage("\(label): \(String(format: "%.0f", sizeKB)) KB")
+    //         return
+    //     }
+    //
+    //     var typeCounts: [String: Int] = [:]
+    //
+    //     if let records = dataDict["records"] as? [[String: Any]] {
+    //         for record in records {
+    //             guard let type = record["type"] as? String else { continue }
+    //             let shortType = type
+    //                 .replacingOccurrences(of: "HKQuantityTypeIdentifier", with: "")
+    //                 .replacingOccurrences(of: "HKCategoryTypeIdentifier", with: "")
+    //             typeCounts[shortType, default: 0] += 1
+    //         }
+    //     }
+    //     if let sleep = dataDict["sleep"] as? [[String: Any]], !sleep.isEmpty {
+    //         typeCounts["sleep"] = sleep.count
+    //     }
+    //     if let workouts = dataDict["workouts"] as? [[String: Any]], !workouts.isEmpty {
+    //         typeCounts["workouts"] = workouts.count
+    //     }
+    //
+    //     let totalCount = typeCounts.values.reduce(0, +)
+    //     let breakdown = typeCounts
+    //         .sorted { $0.value > $1.value }
+    //         .map { "\($0.key): \($0.value)" }
+    //         .joined(separator: ", ")
+    //
+    //     logMessage("\(label) \(String(format: "%.0f", sizeKB)) KB, \(totalCount) items (\(breakdown))")
+    // }
+
     // MARK: - Network Monitoring
     
     internal func startNetworkMonitoring() {

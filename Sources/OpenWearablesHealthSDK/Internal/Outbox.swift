@@ -36,6 +36,43 @@ extension OpenWearablesHealthSDK {
         (200...299).contains(statusCode)
     }
     
+    /// A serialized, compressed upload ready to be sent.
+    /// Built during round prefetch so only the network transfer remains on
+    /// the sync's critical path.
+    internal struct PreparedUpload {
+        let body: Data
+        let isGzipped: Bool
+        let rawByteCount: Int
+        let encodeMs: Int
+        let gzipMs: Int
+    }
+
+    /// CPU half of the upload: JSON-encode and gzip.
+    /// Returns nil (after logging) if the payload could not be serialized.
+    internal func prepareUpload(payload: [String: Any]) -> PreparedUpload? {
+        let encodeStart = Date()
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            logMessage("Failed to serialize payload")
+            return nil
+        }
+        let encodeMs = Int(Date().timeIntervalSince(encodeStart) * 1000)
+
+        let gzipStart = Date()
+        let gzippedBody = data.gzipped()
+        if gzippedBody == nil {
+            logMessage("Payload gzip failed, sending uncompressed")
+        }
+        let gzipMs = Int(Date().timeIntervalSince(gzipStart) * 1000)
+
+        return PreparedUpload(
+            body: gzippedBody ?? data,
+            isGzipped: gzippedBody != nil,
+            rawByteCount: data.count,
+            encodeMs: encodeMs,
+            gzipMs: gzipMs
+        )
+    }
+
     internal func uploadCombinedPayload(
         payload: [String: Any],
         endpoint: URL,
@@ -43,25 +80,37 @@ extension OpenWearablesHealthSDK {
         generation: Int,
         completion: @escaping (Bool) -> Void
     ) {
-        guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
-            self.logMessage("Failed to serialize payload")
+        guard let prepared = prepareUpload(payload: payload) else {
             completion(false)
             return
         }
-        
+        sendPreparedUpload(prepared, endpoint: endpoint, credential: credential, generation: generation, completion: completion)
+    }
+
+    /// Network half of the upload.
+    internal func sendPreparedUpload(
+        _ prepared: PreparedUpload,
+        endpoint: URL,
+        credential: String,
+        generation: Int,
+        completion: @escaping (Bool) -> Void
+    ) {
         let requestId = UUID().uuidString
         var req = buildRequest(url: endpoint, credential: credential, requestId: requestId)
-        req.httpBody = payloadData
-        
-        self.logPayloadSummary(payloadData, label: "Sending")
-        
+        if prepared.isGzipped {
+            req.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
+        }
+        req.httpBody = prepared.body
+
+        let networkStart = Date()
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }
-            
+            let networkMs = Int(Date().timeIntervalSince(networkStart) * 1000)
+
             let completedTask = self.untrackSyncUpload(requestId: requestId)
             let statusCode = (response as? HTTPURLResponse)?.statusCode
             self.logUploadOutcome(
-                stage: "sync", requestId: requestId, declaredBytes: payloadData.count,
+                stage: "sync", requestId: requestId, declaredBytes: prepared.body.count,
                 task: completedTask, statusCode: statusCode, error: error
             )
             
@@ -84,13 +133,15 @@ extension OpenWearablesHealthSDK {
             }
             
             if OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: statusCode) {
+                self.logMessage("HTTP \(statusCode) (network \(networkMs)ms, \(prepared.rawByteCount / 1024) KB -> \(prepared.body.count / 1024) KB)")
                 completion(true)
                 return
             }
-            
+
             if statusCode == 401 {
                 self.handle401ForUpload(
-                    payloadData: payloadData,
+                    payloadData: prepared.body,
+                    isGzipped: prepared.isGzipped,
                     endpoint: endpoint,
                     requestId: requestId,
                     generation: generation,
@@ -115,6 +166,7 @@ extension OpenWearablesHealthSDK {
     /// attempts are one story in the server-side logs.
     private func handle401ForUpload(
         payloadData: Data,
+        isGzipped: Bool,
         endpoint: URL,
         requestId: String,
         generation: Int,
@@ -148,6 +200,9 @@ extension OpenWearablesHealthSDK {
                 
                 let retryKey = "\(requestId)#retry"
                 var retryReq = self.buildRequest(url: endpoint, credential: newCredential, requestId: requestId)
+                if isGzipped {
+                    retryReq.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
+                }
                 retryReq.httpBody = payloadData
                 
                 let retryTask = self.foregroundSession.dataTask(with: retryReq) { [weak self] _, retryResponse, retryError in
