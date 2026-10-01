@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.17.0
+
+Fork release on top of upstream 0.15.0. Published as the `OLHealthKitSDK` pod (module `OpenWearablesHealthSDK`).
+
+* **Gzip request compression**: sync uploads are gzip-compressed (`Content-Encoding: gzip`), including the 401 retry.
+* **Pipelined sync rounds**: the next round is read from HealthKit, serialized and compressed while the current one uploads. Durable progress is still committed only after a 2xx. Foreground rounds carry up to 8000 records (background rounds keep the 100-record chunk).
+* **Sync timing logs**: per-round fetch / map / prep / send timings and total sync duration.
+* **Server sync generation**: the `sync_generation` echoed on `/sync` responses is tracked per user; a change (server-side data reset) clears anchors and the session and restarts as a full export.
 * **Workout sample types**: new `HealthDataType` cases `distanceSwimming`, `swimmingStrokeCount` and `runningSpeed` (iOS 16+). They sync as plain samples under their HealthKit identifiers with units `m`, `count`, `m/s`; on systems that predate an identifier the type resolves to `nil` and is skipped. Together with the running/cycling power, cadence and speed types from 0.15.0, the server binds these samples to the workout they fall in by time window + source and sums them on read, so the workout's own `distance` / `activeEnergyBurned` / `swimmingStrokeCount` statistics are no longer authoritative there (they are still sent).
 * **Deletion propagation**: samples deleted from HealthKit are now reported to the server. The anchored queries used for incremental sync already receive `HKDeletedObject` tombstones; they were previously discarded. The sync payload's `data` object has a new `deleted` array of `{id, type}` entries (`id` = the deleted sample's UUID, `type` = the HK type identifier of the query that reported it). **Server contract**: for each tombstone, delete the stored record whose id equals `id` and any records whose `parentId` equals `id`. Matches the Android SDK 0.12.0 payload change.
   - Deletion-only pages now advance and persist the anchor correctly (previously a page containing only deletions was treated as "no data" and the tombstones were lost).
