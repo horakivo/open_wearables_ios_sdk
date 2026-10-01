@@ -180,6 +180,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// over. Only reached when a run is wedged (e.g. a HealthKit callback that never
     /// arrives); without it a single stuck run would block syncing until app restart.
     private static let cancelledSyncTakeoverDelay: TimeInterval = 60
+    /// How long a full export waits for its start log before reading HealthKit anyway.
+    private static let syncStartLogMaxWait: TimeInterval = 5
     
     /// Whether a sync run currently owns the slot. Stays true after `cancelSync()`
     /// until that run unwinds, so a second loop cannot start on the same SyncState.
@@ -903,8 +905,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                     typeCounts[type.identifier] = state.typeProgress[type.identifier]?.sentCount ?? 0
                 }
             }
+            // The start log opens the backend SyncRun, so give it a head start over the
+            // first /sync batch - but bounded: the request can take up to the session's
+            // 120s timeout, which would burn a background window without uploading.
+            let startLock = NSLock()
+            var started = false
+            let startOnce = {
+                startLock.lock()
+                let first = !started
+                started = true
+                startLock.unlock()
+                if first { startRoundRobin() }
+            }
             sendSyncStartLog(types: queryableTypes, typeCounts: typeCounts, startDate: startDate, endDate: endDate) {
-                startRoundRobin()
+                startOnce()
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.syncStartLogMaxWait) {
+                startOnce()
             }
         } else {
             startRoundRobin()
