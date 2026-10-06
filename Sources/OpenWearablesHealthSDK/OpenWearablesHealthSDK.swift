@@ -41,7 +41,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.17.0"
+    internal static let sdkVersion = "0.17.1"
     
     // MARK: - Public Callbacks
     
@@ -618,6 +618,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         stopForegroundMonitoring()
         cancelAllBGTasks()
         OpenWearablesHealthSdkKeychain.setSyncActive(false)
+    }
+    
+    /// Trigger an immediate incremental sync. Returns right away when a sync is
+    /// already running. Kept in this fork: upstream removed it, but the React Native
+    /// wrapper and host app use it to refresh data when the app opens.
+    public func syncNow(completion: @escaping () -> Void) {
+        syncAll(fullExport: false, completion: completion)
     }
     
     /// Whether sync is currently active.
