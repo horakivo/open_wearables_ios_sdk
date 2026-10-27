@@ -264,10 +264,16 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         let previousHost = sdk.host
         let previousPersisted = OpenWearablesHealthSdkKeychain.getHost()
         let previousRefresh = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl()
+        let previousEndpoints = sdk.endpoints
+        let previousPersistedEndpoints = OpenWearablesHealthSdkKeychain.getEndpoints()
+        sdk.endpoints = nil
+        OpenWearablesHealthSdkKeychain.saveEndpoints(nil)
         defer {
             sdk.host = previousHost
             OpenWearablesHealthSdkKeychain.saveHost(previousPersisted)
             OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(previousRefresh)
+            sdk.endpoints = previousEndpoints
+            OpenWearablesHealthSdkKeychain.saveEndpoints(previousPersistedEndpoints)
         }
         body(sdk)
     }

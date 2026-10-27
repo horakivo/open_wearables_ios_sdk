@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* **Endpoints from the host app**: `configure(endpoints:)` takes the exact sync, logs and (optional) token-refresh and disconnect URLs; `{user_id}` is the only substitution and the SDK appends no path of its own. Without `tokenRefresh` the SDK does not refresh tokens (API-key sign-in); without `disconnect` sign-out skips the server call. The endpoints are persisted for background syncs. `configure(host:)` keeps deriving `{host}/api/v1/...` and clears configured endpoints; `configure(endpoints:)` clears the host.
+
 ## 0.17.1
 
 * **`syncNow(completion:)` restored**: upstream removed it in 0.14.0; the fork keeps it because the React Native wrapper and the host app use it to sync and refresh data when the app opens. It runs an incremental sync and returns immediately when a sync is already running.

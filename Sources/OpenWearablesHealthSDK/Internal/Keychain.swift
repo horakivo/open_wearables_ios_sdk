@@ -16,6 +16,7 @@ internal class OpenWearablesHealthSdkKeychain {
     private static let hostKey = "host"
     private static let customSyncUrlKey = "customSyncUrl"
     private static let customRefreshUrlKey = "customRefreshUrl"
+    private static let endpointsKey = "endpoints"
     private static let syncActiveKey = "syncActive"
     private static let trackedTypesKey = "trackedTypes"
     private static let appInstalledKey = "appInstalled"
@@ -125,6 +126,22 @@ internal class OpenWearablesHealthSdkKeychain {
         return defaults.string(forKey: customRefreshUrlKey)
     }
     
+    /// URL templates from `configure(endpoints:)`. Persisted in the shared suite
+    /// so a background sync (fresh process) reaches the same server.
+    static func saveEndpoints(_ endpoints: OpenWearablesHealthSDK.Endpoints?) {
+        if let endpoints = endpoints, let data = try? JSONEncoder().encode(endpoints) {
+            defaults.set(data, forKey: endpointsKey)
+        } else {
+            defaults.removeObject(forKey: endpointsKey)
+        }
+        defaults.synchronize()
+    }
+
+    static func getEndpoints() -> OpenWearablesHealthSDK.Endpoints? {
+        guard let data = defaults.data(forKey: endpointsKey) else { return nil }
+        return try? JSONDecoder().decode(OpenWearablesHealthSDK.Endpoints.self, from: data)
+    }
+
     // MARK: - Sync Active State
     
     static func setSyncActive(_ active: Bool) {
@@ -179,6 +196,7 @@ internal class OpenWearablesHealthSdkKeychain {
         defaults.removeObject(forKey: hostKey)
         defaults.removeObject(forKey: customSyncUrlKey)
         defaults.removeObject(forKey: customRefreshUrlKey)
+        defaults.removeObject(forKey: endpointsKey)
         defaults.removeObject(forKey: syncActiveKey)
         defaults.removeObject(forKey: trackedTypesKey)
         defaults.removeObject(forKey: syncDaysBackKey)

@@ -57,6 +57,26 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
     // MARK: - Configuration State
     internal var host: String?
+    internal var endpoints: Endpoints?
+
+    /// Where the SDK sends each request, as given to `configure(endpoints:)`.
+    /// Every URL is absolute and used as is, except that `{user_id}` is replaced
+    /// with the signed-in user's id. `tokenRefresh` and `disconnect` are
+    /// optional: without them the SDK does not refresh tokens (sign in with an
+    /// API key) and sign-out skips the server-side disconnect.
+    public struct Endpoints: Codable, Equatable {
+        public let sync: String
+        public let logs: String
+        public let tokenRefresh: String?
+        public let disconnect: String?
+
+        public init(sync: String, logs: String, tokenRefresh: String? = nil, disconnect: String? = nil) {
+            self.sync = sync
+            self.logs = logs
+            self.tokenRefresh = tokenRefresh
+            self.disconnect = disconnect
+        }
+    }
     
     // MARK: - User State (loaded from Keychain)
     internal var userId: String? { OpenWearablesHealthSdkKeychain.getUserId() }
@@ -283,8 +303,27 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         return "\(h)/api/v1"
     }
     
+    /// Endpoints from `configure(endpoints:)`, in memory or persisted for a
+    /// background relaunch. When set, no URL is derived from a host.
+    internal var configuredEndpoints: Endpoints? {
+        endpoints ?? OpenWearablesHealthSdkKeychain.getEndpoints()
+    }
+
+    /// A configured template with `{user_id}` filled in. A template that does not
+    /// resolve to an absolute `http(s)` URL yields `nil` rather than a host URL.
+    internal static func resolve(_ template: String?, userId: String) -> URL? {
+        guard let template = template else { return nil }
+        let resolved = template
+            .replacingOccurrences(of: "{user_id}", with: userId)
+            .replacingOccurrences(of: "{userId}", with: userId)
+        return absoluteHTTPURL(from: resolved)
+    }
+
     internal var syncEndpoint: URL? {
         guard let userId = userId else { return nil }
+        if let endpoints = configuredEndpoints {
+            return Self.resolve(endpoints.sync, userId: userId)
+        }
         guard let base = apiBaseUrl else { return nil }
         return URL(string: "\(base)/sdk/users/\(userId)/sync")
     }
@@ -293,6 +332,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// `logsEndpoint` this one is not under `/sdk`.
     internal var disconnectEndpoint: URL? {
         guard let userId = userId else { return nil }
+        if let endpoints = configuredEndpoints {
+            return Self.resolve(endpoints.disconnect, userId: userId)
+        }
         guard let base = apiBaseUrl else { return nil }
         return URL(string: "\(base)/users/\(userId)/connections/apple")
     }
@@ -305,6 +347,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         if let custom = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl(), !custom.isEmpty {
             return Self.absoluteHTTPURL(from: custom)
         }
+        if configuredEndpoints != nil { return nil }
         guard let base = apiBaseUrl else { return nil }
         return URL(string: "\(base)/token/refresh")
     }
@@ -384,18 +427,40 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         OpenWearablesHealthSdkKeychain.clearKeychainIfReinstalled()
         
         self.host = host
+        self.endpoints = nil
         OpenWearablesHealthSdkKeychain.saveHost(host)
+        OpenWearablesHealthSdkKeychain.saveEndpoints(nil)
         OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(tokenRefreshURL)
-        
-        if let storedTypes = OpenWearablesHealthSdkKeychain.getTrackedTypes() {
-            self.trackedTypes = mapTypesFromStrings(storedTypes)
-            logMessage("Restored \(trackedTypes.count) tracked types")
-        }
         
         if let tokenRefreshURL = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl() {
             logMessage("Configured: host=\(host), tokenRefreshURL=\(tokenRefreshURL)")
         } else {
             logMessage("Configured: host=\(host)")
+        }
+        restoreAfterConfigure()
+    }
+
+    /// Initialize the SDK with the exact URLs it talks to; the SDK appends no
+    /// path of its own. Replaces any host from `configure(host:)`. The
+    /// endpoints are persisted so a background sync in a fresh process uses
+    /// them before `configure` runs again.
+    public func configure(endpoints: Endpoints) {
+        OpenWearablesHealthSdkKeychain.clearKeychainIfReinstalled()
+
+        self.host = nil
+        self.endpoints = endpoints
+        OpenWearablesHealthSdkKeychain.saveHost(nil)
+        OpenWearablesHealthSdkKeychain.saveEndpoints(endpoints)
+        OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(endpoints.tokenRefresh)
+
+        logMessage("Configured: sync=\(endpoints.sync), logs=\(endpoints.logs)")
+        restoreAfterConfigure()
+    }
+
+    private func restoreAfterConfigure() {
+        if let storedTypes = OpenWearablesHealthSdkKeychain.getTrackedTypes() {
+            self.trackedTypes = mapTypesFromStrings(storedTypes)
+            logMessage("Restored \(trackedTypes.count) tracked types")
         }
         
         if OpenWearablesHealthSdkKeychain.isSyncActive() && OpenWearablesHealthSdkKeychain.hasSession() && !trackedTypes.isEmpty {
@@ -673,6 +738,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             "apiKey": OpenWearablesHealthSdkKeychain.getApiKey(),
             "host": OpenWearablesHealthSdkKeychain.getHost(),
             "tokenRefreshURL": OpenWearablesHealthSdkKeychain.getCustomRefreshUrl(),
+            "syncURL": configuredEndpoints?.sync,
+            "logsURL": configuredEndpoints?.logs,
             "isSyncActive": OpenWearablesHealthSdkKeychain.isSyncActive()
         ]
     }

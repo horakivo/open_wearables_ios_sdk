@@ -28,6 +28,8 @@ extension XCTestCase {
         let previousCredentials = OpenWearablesHealthSdkKeychain.volatileStore
         let previousPersistedHost = OpenWearablesHealthSdkKeychain.getHost()
         let previousRefreshUrl = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl()
+        let previousEndpoints = sdk.endpoints
+        let previousPersistedEndpoints = OpenWearablesHealthSdkKeychain.getEndpoints()
 
         let stateDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ow-sdk-tests-\(UUID().uuidString)", isDirectory: true)
@@ -45,6 +47,8 @@ extension XCTestCase {
             OpenWearablesHealthSdkKeychain.volatileStore = previousCredentials
             OpenWearablesHealthSdkKeychain.saveHost(previousPersistedHost)
             OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(previousRefreshUrl)
+            sdk.endpoints = previousEndpoints
+            OpenWearablesHealthSdkKeychain.saveEndpoints(previousPersistedEndpoints)
             try? FileManager.default.removeItem(at: stateDirectory)
         }
 
@@ -61,6 +65,8 @@ extension XCTestCase {
         sdk.host = host
         OpenWearablesHealthSdkKeychain.saveHost(host)
         OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(nil)
+        sdk.endpoints = nil
+        OpenWearablesHealthSdkKeychain.saveEndpoints(nil)
 
         body(sdk, stateDirectory)
     }
