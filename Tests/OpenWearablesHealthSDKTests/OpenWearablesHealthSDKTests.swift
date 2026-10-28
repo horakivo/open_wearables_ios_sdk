@@ -9,14 +9,6 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertNotNil(sdk)
     }
     
-    func testConfigureSetsHost() {
-        let sdk = OpenWearablesHealthSDK.shared
-        sdk.configure(host: "https://test.example.com")
-        // Verify the SDK is configured (host is internal, so we check via credentials)
-        let credentials = sdk.getStoredCredentials()
-        XCTAssertEqual(credentials["host"] as? String, "https://test.example.com")
-    }
-    
     func testIsSessionValidWithoutSignIn() {
         let sdk = OpenWearablesHealthSDK.shared
         // Without sign in, session should not be valid (unless prior state exists)
@@ -40,46 +32,6 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 401))
         XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 500))
         XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 0))
-    }
-
-    func testConfigureWithTokenRefreshURLPersistsOverride() {
-        let sdk = OpenWearablesHealthSDK.shared
-        let refreshURL = "https://auth.example.com/v1/wearables/session"
-        sdk.configure(host: "https://sync.example.com", tokenRefreshURL: refreshURL)
-
-        XCTAssertEqual(OpenWearablesHealthSdkKeychain.getCustomRefreshUrl(), refreshURL)
-        XCTAssertEqual(sdk.tokenRefreshEndpoint?.absoluteString, refreshURL)
-        XCTAssertEqual(sdk.getStoredCredentials()["tokenRefreshURL"] as? String, refreshURL)
-    }
-
-    func testConfigureWithoutTokenRefreshURLClearsOverride() {
-        let sdk = OpenWearablesHealthSDK.shared
-        sdk.configure(
-            host: "https://sync.example.com",
-            tokenRefreshURL: "https://auth.example.com/refresh"
-        )
-        XCTAssertNotNil(OpenWearablesHealthSdkKeychain.getCustomRefreshUrl())
-
-        sdk.configure(host: "https://sync.example.com")
-        XCTAssertNil(OpenWearablesHealthSdkKeychain.getCustomRefreshUrl())
-        XCTAssertEqual(
-            sdk.tokenRefreshEndpoint?.absoluteString,
-            "https://sync.example.com/api/v1/token/refresh"
-        )
-    }
-
-    func testConfigureTreatsBlankTokenRefreshURLAsDefault() {
-        let sdk = OpenWearablesHealthSDK.shared
-        sdk.configure(
-            host: "https://sync.example.com",
-            tokenRefreshURL: "https://auth.example.com/refresh"
-        )
-        sdk.configure(host: "https://sync.example.com", tokenRefreshURL: "   ")
-        XCTAssertNil(OpenWearablesHealthSdkKeychain.getCustomRefreshUrl())
-        XCTAssertEqual(
-            sdk.tokenRefreshEndpoint?.absoluteString,
-            "https://sync.example.com/api/v1/token/refresh"
-        )
     }
 
     func testAbsoluteHTTPURLRejectsRelativeAndNonHTTP() {
@@ -195,80 +147,5 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         )
         let laps = OpenWearablesHealthSDK.shared._buildWorkoutLaps(workout, dateFormatter: ISO8601DateFormatter())
         XCTAssertTrue(laps is NSNull)
-    }
-
-    func testInvalidPersistedRefreshURLDoesNotFallBackToSyncHost() {
-        let sdk = OpenWearablesHealthSDK.shared
-        sdk.configure(host: "https://sync.example.com")
-        OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl("not-a-url")
-        XCTAssertNil(sdk.tokenRefreshEndpoint)
-        sdk.configure(host: "https://sync.example.com")
-    }
-
-    /// Simulates a background cold start: persist the host, then drop the
-    /// in-memory value the way a fresh process looks before `configure` runs.
-    func testApiBaseUrlFallsBackToPersistedHostWithoutConfigure() {
-        withIsolatedHostState { sdk in
-            OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(nil)
-            OpenWearablesHealthSdkKeychain.saveHost("https://bg-relaunch.example.com/")
-            sdk.host = nil
-
-            XCTAssertEqual(sdk.apiBaseUrl, "https://bg-relaunch.example.com/api/v1")
-            XCTAssertEqual(
-                sdk.tokenRefreshEndpoint?.absoluteString,
-                "https://bg-relaunch.example.com/api/v1/token/refresh"
-            )
-        }
-    }
-
-    func testApiBaseUrlPrefersInMemoryHostOverPersisted() {
-        withIsolatedHostState { sdk in
-            OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(nil)
-            OpenWearablesHealthSdkKeychain.saveHost("https://persisted.example.com")
-            sdk.host = "https://in-memory.example.com"
-
-            XCTAssertEqual(sdk.apiBaseUrl, "https://in-memory.example.com/api/v1")
-        }
-    }
-
-    func testApiBaseUrlNilWhenHostMissingFromMemoryAndPersistence() {
-        withIsolatedHostState { sdk in
-            OpenWearablesHealthSdkKeychain.saveHost(nil)
-            OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(nil)
-            sdk.host = nil
-
-            XCTAssertNil(sdk.apiBaseUrl)
-            XCTAssertNil(sdk.tokenRefreshEndpoint)
-        }
-    }
-
-    func testTokenRefreshUsesPersistedCustomURLWhenHostNotInMemory() {
-        withIsolatedHostState { sdk in
-            OpenWearablesHealthSdkKeychain.saveHost(nil)
-            OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl("https://auth.example.com/v1/refresh")
-            sdk.host = nil
-
-            XCTAssertNil(sdk.apiBaseUrl)
-            XCTAssertEqual(
-                sdk.tokenRefreshEndpoint?.absoluteString,
-                "https://auth.example.com/v1/refresh"
-            )
-        }
-    }
-
-    /// The SDK is a singleton, so `init`'s `getHost()` restore cannot be
-    /// re-run. These tests clear `host` in memory and rely on the same
-    /// persistence fallback `apiBaseUrl` / `tokenRefreshEndpoint` use.
-    private func withIsolatedHostState(_ body: (OpenWearablesHealthSDK) -> Void) {
-        let sdk = OpenWearablesHealthSDK.shared
-        let previousHost = sdk.host
-        let previousPersisted = OpenWearablesHealthSdkKeychain.getHost()
-        let previousRefresh = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl()
-        defer {
-            sdk.host = previousHost
-            OpenWearablesHealthSdkKeychain.saveHost(previousPersisted)
-            OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(previousRefresh)
-        }
-        body(sdk)
     }
 }

@@ -7,8 +7,8 @@ extension OpenWearablesHealthSDK {
     // MARK: - Logs Endpoint
 
     internal var logsEndpoint: URL? {
-        guard let userId = userId, let base = apiBaseUrl else { return nil }
-        return URL(string: "\(base)/sdk/users/\(userId)/logs")
+        guard let userId = userId else { return nil }
+        return Self.resolve(configuredEndpoints?.logs, userId: userId)
     }
 
     // MARK: - Device State Collection

@@ -55,8 +55,15 @@ sdk.onAuthError = { statusCode, message in
     print("Auth error: \(statusCode) - \(message)")
 }
 
-// Configure
-sdk.configure(host: "https://api.example.com")
+// Configure: every URL the SDK calls; `{user_id}` is filled in with the signed-in user.
+// `tokenRefresh` and `disconnect` are optional; without them the SDK does not refresh
+// tokens (API-key sign-in) and sign-out skips the server-side disconnect.
+try sdk.configure(endpoints: .init(
+    sync: "https://api.example.com/api/v1/sdk/users/{user_id}/sync",
+    logs: "https://api.example.com/api/v1/sdk/users/{user_id}/logs",
+    tokenRefresh: "https://api.example.com/api/v1/token/refresh",
+    disconnect: "https://api.example.com/api/v1/users/{user_id}/connections/apple"
+))
 
 // Sign in (token-based)
 sdk.signIn(

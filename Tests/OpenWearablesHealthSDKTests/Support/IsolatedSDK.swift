@@ -16,18 +16,22 @@ extension XCTestCase {
         userId: String = "test-user",
         accessToken: String? = "access-1",
         refreshToken: String? = "refresh-1",
-        host: String = "https://sync.example.test",
-        _ body: (OpenWearablesHealthSDK, URL) -> Void
-    ) {
+        endpoints: OpenWearablesHealthSDK.Endpoints = .init(
+            sync: "https://sync.example.test/api/v1/sdk/users/{user_id}/sync",
+            logs: "https://sync.example.test/api/v1/sdk/users/{user_id}/logs",
+            tokenRefresh: "https://sync.example.test/api/v1/token/refresh",
+            disconnect: "https://sync.example.test/api/v1/users/{user_id}/connections/apple"
+        ),
+        _ body: (OpenWearablesHealthSDK, URL) throws -> Void
+    ) rethrows {
         let sdk = OpenWearablesHealthSDK.shared
 
         let previousStateDirectory = sdk.stateDirectoryOverride
         let previousSession: URLSession? = sdk.foregroundSession
-        let previousHost = sdk.host
         let previousAuthErrorHandler = sdk.onAuthError
         let previousCredentials = OpenWearablesHealthSdkKeychain.volatileStore
-        let previousPersistedHost = OpenWearablesHealthSdkKeychain.getHost()
-        let previousRefreshUrl = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl()
+        let previousEndpoints = sdk.endpoints
+        let previousPersistedEndpoints = OpenWearablesHealthSdkKeychain.getEndpoints()
 
         let stateDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ow-sdk-tests-\(UUID().uuidString)", isDirectory: true)
@@ -41,10 +45,9 @@ extension XCTestCase {
             sdk.onAuthError = previousAuthErrorHandler
             sdk.foregroundSession = previousSession
             sdk.stateDirectoryOverride = previousStateDirectory
-            sdk.host = previousHost
             OpenWearablesHealthSdkKeychain.volatileStore = previousCredentials
-            OpenWearablesHealthSdkKeychain.saveHost(previousPersistedHost)
-            OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(previousRefreshUrl)
+            sdk.endpoints = previousEndpoints
+            OpenWearablesHealthSdkKeychain.saveEndpoints(previousPersistedEndpoints)
             try? FileManager.default.removeItem(at: stateDirectory)
         }
 
@@ -58,11 +61,10 @@ extension XCTestCase {
         )
         // Set directly rather than through `configure`, which has side effects (session
         // restore, observer registration) that are not part of what these tests exercise.
-        sdk.host = host
-        OpenWearablesHealthSdkKeychain.saveHost(host)
-        OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(nil)
+        sdk.endpoints = endpoints
+        OpenWearablesHealthSdkKeychain.saveEndpoints(endpoints)
 
-        body(sdk, stateDirectory)
+        try body(sdk, stateDirectory)
     }
 
     /// Spins the main run loop until `condition` holds or `timeout` elapses, so the

@@ -13,9 +13,11 @@ internal class OpenWearablesHealthSdkKeychain {
     private static let userIdKey = "userId"
     private static let apiKeyKey = "apiKey"
     private static let baseUrlKey = "baseUrl"
+    // Written by versions before `configure(endpoints:)`; only cleared now.
     private static let hostKey = "host"
     private static let customSyncUrlKey = "customSyncUrl"
     private static let customRefreshUrlKey = "customRefreshUrl"
+    private static let endpointsKey = "endpoints"
     private static let syncActiveKey = "syncActive"
     private static let trackedTypesKey = "trackedTypes"
     private static let appInstalledKey = "appInstalled"
@@ -80,21 +82,6 @@ internal class OpenWearablesHealthSdkKeychain {
         return getAccessToken() != nil || getApiKey() != nil
     }
     
-    // MARK: - Host (stored in UserDefaults, not sensitive)
-    
-    static func saveHost(_ host: String?) {
-        if let host = host {
-            defaults.set(host, forKey: hostKey)
-        } else {
-            defaults.removeObject(forKey: hostKey)
-        }
-        defaults.synchronize()
-    }
-    
-    static func getHost() -> String? {
-        return defaults.string(forKey: hostKey)
-    }
-    
     // Legacy - kept for migration/cleanup
     static func saveCustomSyncUrl(_ url: String?) {
         if let url = url {
@@ -109,22 +96,22 @@ internal class OpenWearablesHealthSdkKeychain {
         return defaults.string(forKey: customSyncUrlKey)
     }
 
-    /// Optional override for the token-refresh endpoint. When unset, the SDK
-    /// refreshes against `{apiBaseUrl}/token/refresh`. Persisted in the shared
-    /// suite so a background refresh task (fresh process) can read it.
-    static func saveCustomRefreshUrl(_ url: String?) {
-        if let url = url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
-            defaults.set(url, forKey: customRefreshUrlKey)
+    /// URLs from `configure(endpoints:)`. Persisted in the shared suite so a
+    /// background sync (fresh process) reaches the same server.
+    static func saveEndpoints(_ endpoints: OpenWearablesHealthSDK.Endpoints?) {
+        if let endpoints = endpoints, let data = try? JSONEncoder().encode(endpoints) {
+            defaults.set(data, forKey: endpointsKey)
         } else {
-            defaults.removeObject(forKey: customRefreshUrlKey)
+            defaults.removeObject(forKey: endpointsKey)
         }
         defaults.synchronize()
     }
 
-    static func getCustomRefreshUrl() -> String? {
-        return defaults.string(forKey: customRefreshUrlKey)
+    static func getEndpoints() -> OpenWearablesHealthSDK.Endpoints? {
+        guard let data = defaults.data(forKey: endpointsKey) else { return nil }
+        return try? JSONDecoder().decode(OpenWearablesHealthSDK.Endpoints.self, from: data)
     }
-    
+
     // MARK: - Sync Active State
     
     static func setSyncActive(_ active: Bool) {
@@ -179,6 +166,7 @@ internal class OpenWearablesHealthSdkKeychain {
         defaults.removeObject(forKey: hostKey)
         defaults.removeObject(forKey: customSyncUrlKey)
         defaults.removeObject(forKey: customRefreshUrlKey)
+        defaults.removeObject(forKey: endpointsKey)
         defaults.removeObject(forKey: syncActiveKey)
         defaults.removeObject(forKey: trackedTypesKey)
         defaults.removeObject(forKey: syncDaysBackKey)
