@@ -56,7 +56,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     public var onAuthError: ((Int, String) -> Void)?
 
     // MARK: - Configuration State
-    internal var host: String?
     internal var endpoints: Endpoints?
 
     /// Where the SDK sends each request, as given to `configure(endpoints:)`.
@@ -75,6 +74,18 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             self.logs = logs
             self.tokenRefresh = tokenRefresh
             self.disconnect = disconnect
+        }
+    }
+
+    public enum ConfigurationError: Error, LocalizedError {
+        /// The endpoint named `name` is not an absolute `http(s)` URL.
+        case invalidURL(name: String, value: String)
+
+        public var errorDescription: String? {
+            switch self {
+            case let .invalidURL(name, value):
+                return "Open Wearables \(name) endpoint is not an absolute http(s) URL: \(value)"
+            }
         }
     }
     
@@ -297,59 +308,29 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
     // MARK: - API Endpoints
     
-    internal var apiBaseUrl: String? {
-        guard let host = host ?? OpenWearablesHealthSdkKeychain.getHost() else { return nil }
-        let h = host.hasSuffix("/") ? String(host.dropLast()) : host
-        return "\(h)/api/v1"
-    }
-    
     /// Endpoints from `configure(endpoints:)`, in memory or persisted for a
-    /// background relaunch. When set, no URL is derived from a host.
+    /// background relaunch that runs before `configure`.
     internal var configuredEndpoints: Endpoints? {
         endpoints ?? OpenWearablesHealthSdkKeychain.getEndpoints()
     }
 
-    /// A configured template with `{user_id}` filled in. A template that does not
-    /// resolve to an absolute `http(s)` URL yields `nil` rather than a host URL.
     internal static func resolve(_ template: String?, userId: String) -> URL? {
         guard let template = template else { return nil }
-        let resolved = template
-            .replacingOccurrences(of: "{user_id}", with: userId)
-            .replacingOccurrences(of: "{userId}", with: userId)
-        return absoluteHTTPURL(from: resolved)
+        return absoluteHTTPURL(from: template.replacingOccurrences(of: "{user_id}", with: userId))
     }
 
     internal var syncEndpoint: URL? {
         guard let userId = userId else { return nil }
-        if let endpoints = configuredEndpoints {
-            return Self.resolve(endpoints.sync, userId: userId)
-        }
-        guard let base = apiBaseUrl else { return nil }
-        return URL(string: "\(base)/sdk/users/\(userId)/sync")
+        return Self.resolve(configuredEndpoints?.sync, userId: userId)
     }
 
-    /// Connection resource deleted on sign out. Unlike `syncEndpoint` and
-    /// `logsEndpoint` this one is not under `/sdk`.
     internal var disconnectEndpoint: URL? {
         guard let userId = userId else { return nil }
-        if let endpoints = configuredEndpoints {
-            return Self.resolve(endpoints.disconnect, userId: userId)
-        }
-        guard let base = apiBaseUrl else { return nil }
-        return URL(string: "\(base)/users/\(userId)/connections/apple")
+        return Self.resolve(configuredEndpoints?.disconnect, userId: userId)
     }
 
-    /// Token-refresh URL. An absolute `tokenRefreshURL` from `configure` wins;
-    /// otherwise `{host}/api/v1/token/refresh`. A stored override that is not a
-    /// valid `http(s)` URL is treated as missing rather than falling back to the
-    /// sync host (that would silently refresh against the wrong server).
     internal var tokenRefreshEndpoint: URL? {
-        if let custom = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl(), !custom.isEmpty {
-            return Self.absoluteHTTPURL(from: custom)
-        }
-        if configuredEndpoints != nil { return nil }
-        guard let base = apiBaseUrl else { return nil }
-        return URL(string: "\(base)/token/refresh")
+        configuredEndpoints?.tokenRefresh.flatMap(Self.absoluteHTTPURL(from:))
     }
 
     internal static func absoluteHTTPURL(from string: String) -> URL? {
@@ -368,8 +349,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     private override init() {
         super.init()
-        // Fresh BGTask processes never see `configure` before the first refresh.
-        self.host = OpenWearablesHealthSdkKeychain.getHost()
         
         let bgCfg = URLSessionConfiguration.background(withIdentifier: bgSessionId)
         bgCfg.isDiscretionary = false
@@ -411,47 +390,30 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Public API: Configure
     
-    /// Initialize the SDK with the backend host URL.
-    /// This also restores previously tracked types and auto-resumes sync if it was active.
-    ///
-    /// - Parameters:
-    ///   - host: Base host for the data-sync API (`{host}/api/v1/...`).
-    ///   - tokenRefreshURL: Optional absolute URL used to refresh the access
-    ///     token (`POST {"refresh_token"}` → `{"access_token","refresh_token"}`).
-    ///     When omitted or empty, the SDK uses `{host}/api/v1/token/refresh`
-    ///     and clears any previously stored override. Pass this on every
-    ///     `configure` call when the auth/mint server is not the sync host —
-    ///     the value is persisted so a background `BGTask` in a fresh process
-    ///     can refresh before `configure` runs again.
-    public func configure(host: String, tokenRefreshURL: String? = nil) {
-        OpenWearablesHealthSdkKeychain.clearKeychainIfReinstalled()
-        
-        self.host = host
-        self.endpoints = nil
-        OpenWearablesHealthSdkKeychain.saveHost(host)
-        OpenWearablesHealthSdkKeychain.saveEndpoints(nil)
-        OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(tokenRefreshURL)
-        
-        if let tokenRefreshURL = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl() {
-            logMessage("Configured: host=\(host), tokenRefreshURL=\(tokenRefreshURL)")
-        } else {
-            logMessage("Configured: host=\(host)")
-        }
-        restoreAfterConfigure()
-    }
-
     /// Initialize the SDK with the exact URLs it talks to; the SDK appends no
-    /// path of its own. Replaces any host from `configure(host:)`. The
-    /// endpoints are persisted so a background sync in a fresh process uses
-    /// them before `configure` runs again.
-    public func configure(endpoints: Endpoints) {
+    /// path of its own. This also restores previously tracked types and
+    /// auto-resumes sync if it was active.
+    ///
+    /// The endpoints are persisted so a background sync in a fresh process
+    /// uses them before `configure` runs again.
+    ///
+    /// - Throws: `ConfigurationError.invalidURL` when an endpoint is not an
+    ///   absolute `http(s)` URL; the previous configuration stays in place.
+    public func configure(endpoints: Endpoints) throws {
+        let named: [(String, String?)] = [
+            ("sync", endpoints.sync),
+            ("logs", endpoints.logs),
+            ("tokenRefresh", endpoints.tokenRefresh),
+            ("disconnect", endpoints.disconnect),
+        ]
+        for case let (name, template?) in named where Self.resolve(template, userId: "user") == nil {
+            throw ConfigurationError.invalidURL(name: name, value: template)
+        }
+
         OpenWearablesHealthSdkKeychain.clearKeychainIfReinstalled()
 
-        self.host = nil
         self.endpoints = endpoints
-        OpenWearablesHealthSdkKeychain.saveHost(nil)
         OpenWearablesHealthSdkKeychain.saveEndpoints(endpoints)
-        OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(endpoints.tokenRefresh)
 
         logMessage("Configured: sync=\(endpoints.sync), logs=\(endpoints.logs)")
         restoreAfterConfigure()
@@ -736,10 +698,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             "accessToken": OpenWearablesHealthSdkKeychain.getAccessToken(),
             "refreshToken": OpenWearablesHealthSdkKeychain.getRefreshToken(),
             "apiKey": OpenWearablesHealthSdkKeychain.getApiKey(),
-            "host": OpenWearablesHealthSdkKeychain.getHost(),
-            "tokenRefreshURL": OpenWearablesHealthSdkKeychain.getCustomRefreshUrl(),
             "syncURL": configuredEndpoints?.sync,
             "logsURL": configuredEndpoints?.logs,
+            "tokenRefreshURL": configuredEndpoints?.tokenRefresh,
+            "disconnectURL": configuredEndpoints?.disconnect,
             "isSyncActive": OpenWearablesHealthSdkKeychain.isSyncActive()
         ]
     }
