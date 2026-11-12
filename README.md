@@ -91,6 +91,14 @@ sdk.requestAuthorization(types: [.steps, .heartRate, .sleep]) { granted in
     }
 }
 
+// Per type: pause (keeps what the server has), resume (continues from where it
+// stopped), or read a type's whole history again. Ids are `HealthDataType` raw values.
+sdk.pauseTypes(types: ["heartRate"])
+sdk.resumeTypes(types: ["heartRate"])
+sdk.resyncTypes(types: ["sleep"]) { /* scheduled, not finished */ }
+sdk.getPausedTypes()                       // ["heartRate"] while paused
+sdk.getSyncStatus()["resyncingTypes"]      // types still being read again
+
 // Stop sync
 sdk.stopBackgroundSync()
 

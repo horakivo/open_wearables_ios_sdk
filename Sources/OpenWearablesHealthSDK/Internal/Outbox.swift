@@ -292,15 +292,17 @@ extension OpenWearablesHealthSDK {
         }
         
         if let anchorPath = anchorPath, !anchorPath.isEmpty {
+            // A resync removed these anchors on purpose; an old item must not restore them.
+            let resyncing = pendingResyncHKIdentifiers()
             if item.typeIdentifier == "combined" {
                 if let anchorData = try? Data(contentsOf: URL(fileURLWithPath: anchorPath)),
                    let anchorsDict = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSDictionary.self, NSString.self, NSData.self], from: anchorData) as? [String: Data] {
-                    for (typeId, anchorData) in anchorsDict {
+                    for (typeId, anchorData) in anchorsDict where !resyncing.contains(typeId) {
                         saveAnchorData(anchorData, typeIdentifier: typeId, userKey: item.userKey)
                     }
                     logMessage("Saved anchors for \(anchorsDict.count) types")
                 }
-            } else {
+            } else if !resyncing.contains(item.typeIdentifier) {
                 if let anchorData = try? Data(contentsOf: URL(fileURLWithPath: anchorPath)) {
                     saveAnchorData(anchorData, typeIdentifier: item.typeIdentifier, userKey: item.userKey)
                 }

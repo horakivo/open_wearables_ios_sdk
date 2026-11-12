@@ -37,12 +37,21 @@ extension OpenWearablesHealthSDK {
         }
     }
 
+    /// Clears the anchor of every type stored for this user - not only the tracked
+    /// ones, or a paused or no-longer-tracked type would keep a stale anchor into the
+    /// next export. Pending resyncs go too (the full export supersedes them); the
+    /// paused list does not.
     internal func resetAllAnchors() {
-        for t in trackedTypes {
-            defaults.removeObject(forKey: anchorKey(for: t))
+        typeStateLock.lock()
+        defer { typeStateLock.unlock() }
+        invalidateAllTypesInFlight()
+        let prefix = "anchor.\(userKey())."
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(prefix) {
+            defaults.removeObject(forKey: key)
         }
         defaults.set(false, forKey: fullDoneKey())
         defaults.removeObject(forKey: serverSyncGenerationKey())
+        saveResyncTypeIds([])
     }
 
     // MARK: - Sync generation
