@@ -23,6 +23,7 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertNotNil(status["sentCount"])
         XCTAssertNotNil(status["completedTypes"])
         XCTAssertNotNil(status["isFullExport"])
+        XCTAssertEqual(status["syncState"] as? String, "idle")
     }
     
     func testSyncShouldAdvanceOnlyOn2xx() {

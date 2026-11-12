@@ -240,6 +240,8 @@ extension OpenWearablesHealthSDK {
         let pausedTypes = getPausedTypes()
         // Pending or running; a resync of a type paused since stays pending until resume.
         let resyncingTypes = loadResyncTypeIds()
+        // Same values as the Android SDK; iOS has no job queue, so it never reports "scheduled".
+        let syncState = isSyncingVisible ? "running" : "idle"
         
         if let state = loadSyncState() {
             return [
@@ -249,6 +251,7 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": state.fullExport,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncingVisible,
+                "syncState": syncState,
                 "pausedTypes": pausedTypes,
                 "resyncingTypes": resyncingTypes,
                 "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
@@ -261,6 +264,7 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": false,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncingVisible,
+                "syncState": syncState,
                 "pausedTypes": pausedTypes,
                 "resyncingTypes": resyncingTypes,
                 "createdAt": NSNull()

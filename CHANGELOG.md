@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.1
+
+* **`getSyncStatus()["syncState"]`**: `"running"` while a sync runs, otherwise `"idle"`. Same field as the Android SDK, which also reports `"scheduled"` and `"unknown"` for its WorkManager job; iOS has no job queue, so it never does.
+
 ## 0.19.0
 
 * **Per-type pause / resume / resync**: `pauseTypes(types:)`, `resumeTypes(types:)`, `getPausedTypes()` and `resyncTypes(types:completion:)` (plus an `async` form) take `HealthDataType` raw values.
