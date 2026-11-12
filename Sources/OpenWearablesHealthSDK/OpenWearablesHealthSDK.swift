@@ -41,7 +41,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.18.0"
+    internal static let sdkVersion = "0.19.0"
     
     // MARK: - Public Callbacks
     
@@ -197,6 +197,20 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // aborted sync re-drives itself as a full export once it unwinds.
     internal var serverGenerationResetPending = false
     private let syncLock = NSLock()
+    /// Set when a type is resumed or resynced while a run owns the slot: that run has
+    /// already dropped or never had the type, so another run follows once it unwinds.
+    /// Guarded by `syncLock`.
+    private var typeChangeSyncPending = false
+    
+    /// Serializes every read-modify-write of the sync state file and the per-type
+    /// invalidation below. Recursive because `loadSyncState()` may clear the session.
+    internal let typeStateLock = NSRecursiveLock()
+    /// Bumped by each pause, resync and anchor reset. A run snapshots it at start.
+    internal var typeEpoch = 0
+    /// HealthKit identifier -> epoch at which it was last paused or resynced.
+    internal var typeInvalidatedAt: [String: Int] = [:]
+    /// Epoch of the last `resetAllAnchors()`, which invalidates every type.
+    internal var allTypesInvalidatedAt = 0
     internal var fullSyncStartTime: Date?
     
     /// Identifies a single sync run. A cancelled run is never "un-cancelled": the next
@@ -289,8 +303,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         return base ?? FileManager.default.temporaryDirectory
     }
 
-    // Observer queries
+    // Observer queries. Mutated from the caller's queue (the React Native wrapper calls
+    // in from its module queue, not main), so every access holds the lock.
     internal var activeObserverQueries: [HKObserverQuery] = []
+    internal let observerQueriesLock = NSRecursiveLock()
 
     // Background session
     internal let bgSessionId = "com.openwearables.healthsdk.upload.session"
@@ -523,6 +539,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         resetAllAnchors()
         clearSyncSession()
         clearOutbox()
+        // Keyed by user id, so before `clearAll` removes it.
+        OpenWearablesHealthSdkKeychain.savePausedTypes([], userKey: userKey())
         OpenWearablesHealthSdkKeychain.clearAll()
         
         logMessage("Sign out complete - all sync state reset")
@@ -678,8 +696,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     /// Reset all sync anchors - forces full re-export on next sync.
     public func resetAnchors() {
+        // One lock, so no run commit lands between clearing the anchors and the session.
+        typeStateLock.lock()
         resetAllAnchors()
         clearSyncSession()
+        typeStateLock.unlock()
         clearOutbox()
         logMessage("Anchors reset - will perform full sync on next sync")
         
@@ -688,6 +709,95 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             self.syncAll(fullExport: true) {
                 self.logMessage("Full export after reset completed")
             }
+        }
+    }
+    
+    // MARK: - Public API: Per-type control
+    
+    /// Stops syncing the given types and keeps what the server already has. Takes the
+    /// `HealthDataType` raw values (e.g. "heartRate", "sleep"); unknown ids are stored
+    /// anyway, so a type can be paused before it is authorized. Never prompts for
+    /// HealthKit permission.
+    ///
+    /// The paused list is kept per user until `signOut()`. It is independent of the
+    /// types passed to `requestAuthorization` and survives `resetAnchors()`. Each
+    /// paused type keeps its anchor, so `resumeTypes` continues where it stopped.
+    /// Aliases pause together: `restingEnergy` and `basalEnergy` are one HealthKit
+    /// type, as are `bloodOxygen` and `oxygenSaturation`; `bloodPressure` stands for
+    /// its systolic and diastolic types.
+    ///
+    /// A sync run in flight stops reading the types and does not save their progress.
+    /// A batch it is already uploading may still carry them.
+    public func pauseTypes(types: [String]) {
+        let ids = Self.uniqueTypeIds(types)
+        guard !ids.isEmpty else { return }
+        let key = userKey()
+        let current = OpenWearablesHealthSdkKeychain.getPausedTypes(userKey: key)
+        OpenWearablesHealthSdkKeychain.savePausedTypes(current + ids.filter { !current.contains($0) }, userKey: key)
+        
+        let sampleTypes = ids.flatMap { Self.sampleTypes(forTypeId: $0) }
+        invalidateTypesInFlight(Set(sampleTypes.map { $0.identifier }))
+        
+        if OpenWearablesHealthSdkKeychain.isSyncActive() {
+            stopObservers(for: sampleTypes)
+        }
+        logMessage("Paused types: \(ids.joined(separator: ", "))")
+    }
+    
+    /// Syncs the given types again and starts a sync. Each type continues from the
+    /// anchor it kept while paused, so changes made meanwhile (deletions included)
+    /// arrive. A type without an anchor - paused before its first export finished -
+    /// has its history read again, the same as `resyncTypes`.
+    public func resumeTypes(types: [String]) {
+        let ids = Self.uniqueTypeIds(types)
+        guard !ids.isEmpty else { return }
+        let key = userKey()
+        let remaining = OpenWearablesHealthSdkKeychain.getPausedTypes(userKey: key).filter { !ids.contains($0) }
+        OpenWearablesHealthSdkKeychain.savePausedTypes(remaining, userKey: key)
+        
+        let resyncing = markResyncForTypesWithoutAnchor(typeIds: ids)
+        logMessage("Resumed types: \(ids.joined(separator: ", "))"
+            + (resyncing.isEmpty ? "" : " (no anchor, reading history again: \(resyncing.joined(separator: ", ")))"))
+        
+        if OpenWearablesHealthSdkKeychain.isSyncActive() {
+            // A type still paused under an alias stays without an observer.
+            let stillPaused = pausedHKIdentifiers()
+            let queryable = Set(getQueryableTypes().map { $0.identifier })
+            let resumed = ids.flatMap { Self.sampleTypes(forTypeId: $0) }
+                .filter { queryable.contains($0.identifier) && !stillPaused.contains($0.identifier) }
+            startObservers(for: resumed)
+        }
+        requestSyncAfterTypeChange()
+    }
+    
+    /// The paused types, exactly as passed to `pauseTypes`. Cheap enough to poll.
+    public func getPausedTypes() -> [String] {
+        OpenWearablesHealthSdkKeychain.getPausedTypes(userKey: userKey())
+    }
+    
+    /// Reads the whole history of the given types again (bounded by `syncDaysBack`)
+    /// and uploads it; the server upserts by record id, so nothing duplicates.
+    /// `completion` runs once the resync is scheduled and a sync was started, not when
+    /// it finishes - `getSyncStatus()["resyncingTypes"]` lists the types until they
+    /// are done.
+    ///
+    /// Ignores paused, unknown and untracked types. Before the initial export has
+    /// finished, a type that export has not completed yet is left to it.
+    public func resyncTypes(types: [String], completion: (() -> Void)? = nil) {
+        let scheduled = scheduleResync(typeIds: types)
+        if scheduled.isEmpty {
+            logMessage("Resync: nothing to schedule for \(types.joined(separator: ", "))")
+        } else {
+            logMessage("Resync scheduled: \(scheduled.joined(separator: ", "))")
+            requestSyncAfterTypeChange()
+        }
+        completion?()
+    }
+    
+    /// Async form of `resyncTypes(types:completion:)`.
+    public func resyncTypes(types: [String]) async {
+        await withCheckedContinuation { continuation in
+            resyncTypes(types: types) { continuation.resume() }
         }
     }
     
@@ -819,6 +929,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             completion()
             return
         }
+        // After the slot is claimed and before the paused list or any cursor is read. A
+        // pause or resync that lands later is caught by the run's checks (see
+        // `isTypeInvalidated`) and, because the slot is taken, queues a follow-up run; one
+        // that landed earlier is already part of this snapshot.
+        let typeEpoch = currentTypeEpoch()
         
         guard HKHealthStore.isHealthDataAvailable() else {
             logMessage("HealthKit not available")
@@ -834,9 +949,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        let queryableTypes = getQueryableTypes()
+        // Paused types are filtered here, not in `getQueryableTypes`, which also feeds
+        // authorization. The first export skips them too and may finish without them;
+        // resuming such a type then reads its history (it has no anchor).
+        let paused = pausedHKIdentifiers()
+        let queryableTypes = getQueryableTypes().filter { !paused.contains($0.identifier) }
         guard !queryableTypes.isEmpty else {
-            logMessage("No queryable types")
+            logMessage(paused.isEmpty ? "No queryable types" : "No queryable types (all paused)")
             finishSync(generation: generation)
             completion()
             return
@@ -887,7 +1006,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 fullExport: effectiveFullExport,
                 endpoint: endpoint,
                 isBackground: isBackground,
-                generation: generation
+                generation: generation,
+                typeEpoch: typeEpoch
             ) { [weak self] allTypesCompleted in
                 guard let self = self else { return }
                 
@@ -964,10 +1084,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let generation: Int
         /// Whether the caller already knows it runs in the background (BG tasks do).
         let declaredBackground: Bool
+        /// `typeEpoch` at run start; types invalidated after it are dropped from the run.
+        let typeEpoch: Int
         
-        init(generation: Int, declaredBackground: Bool) {
+        init(generation: Int, declaredBackground: Bool, typeEpoch: Int) {
             self.generation = generation
             self.declaredBackground = declaredBackground
+            self.typeEpoch = typeEpoch
         }
     }
     
@@ -988,9 +1111,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         endpoint: URL,
         isBackground: Bool,
         generation: Int,
+        typeEpoch: Int,
         completion: @escaping (Bool) -> Void
     ) {
-        let rrState = RoundRobinState(generation: generation, declaredBackground: isBackground)
+        let rrState = RoundRobinState(generation: generation, declaredBackground: isBackground, typeEpoch: typeEpoch)
         
         let resumeInfo = getResumeCursors()
         rrState.completedTypes = resumeInfo.completedTypes
@@ -1025,7 +1149,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Round result for accumulating fetched data
     
-    private struct TypeRoundResult {
+    internal struct TypeRoundResult {
         let type: HKSampleType
         let samples: [HKSample]
         /// Deletion tombstones ({id, type}) reported by the anchored query.
@@ -1035,6 +1159,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let newAnchor: HKQueryAnchor?
         let anchorData: Data?
         let isDone: Bool
+        /// HealthKit returned an error (other than locked data) and the type was skipped
+        /// for this run. Its position is still saved, but a pending resync is not
+        /// considered finished: the history after that position has not been read yet.
+        var failed: Bool = false
     }
     
     // MARK: - Round-Robin with combined payloads, pipelined read + upload
@@ -1044,7 +1172,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// reflect it, so the next round can be prefetched while this one uploads;
     /// durable progress is written only in `commitRound` after the upload
     /// succeeds.
-    private struct PendingRound {
+    internal struct PendingRound {
         let withData: [TypeRoundResult]
         let emptyDone: [TypeRoundResult]
         let itemCount: Int
@@ -1052,6 +1180,36 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let roundIndex: Int
         let fetchMs: Int
         let mapMs: Int
+    }
+
+    /// Returns the round without the types paused or resynced since `typeEpoch`, with
+    /// its payload rebuilt from what is left (no payload when nothing is), or the round
+    /// itself when nothing changed. Nil only when the rebuilt payload cannot be prepared.
+    internal func excludingInvalidatedTypes(_ round: PendingRound, typeEpoch: Int) -> PendingRound? {
+        let kept = round.withData.filter { !isTypeInvalidated($0.type.identifier, since: typeEpoch) }
+        guard kept.count != round.withData.count else { return round }
+
+        let dropped = round.withData.filter { isTypeInvalidated($0.type.identifier, since: typeEpoch) }
+        logMessage("Dropping \(dropped.map { shortTypeName($0.type.identifier) }.joined(separator: ", ")) from round \(round.roundIndex) (paused or resynced)")
+
+        let samples = kept.flatMap { $0.samples }
+        let deleted = kept.flatMap { $0.deleted }
+        var prepared: PreparedUpload? = nil
+        if !samples.isEmpty || !deleted.isEmpty {
+            guard let upload = prepareUpload(payload: buildCombinedPayload(samples: samples, deleted: deleted)) else {
+                return nil
+            }
+            prepared = upload
+        }
+        return PendingRound(
+            withData: kept,
+            emptyDone: round.emptyDone,
+            itemCount: samples.count + deleted.count,
+            prepared: prepared,
+            roundIndex: round.roundIndex,
+            fetchMs: round.fetchMs,
+            mapMs: round.mapMs
+        )
     }
 
     /// Fetches one round from HealthKit and advances session-local cursors.
@@ -1067,7 +1225,12 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
 
-        let incompleteTypes = types.filter { !rrState.completedTypes.contains($0.identifier) }
+        // A type paused or resynced mid-run is not read again by this run; the run that
+        // follows picks up a resync.
+        let incompleteTypes = types.filter {
+            !rrState.completedTypes.contains($0.identifier)
+                && !isTypeInvalidated($0.identifier, since: rrState.typeEpoch)
+        }
         if incompleteTypes.isEmpty {
             completion(true, nil)
             return
@@ -1153,6 +1316,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         // the next incremental sync would run an anchored query from nil and re-crawl
         // the whole history oldest-first. Pause the sync instead - on resume the type
         // re-sends its last chunk (deduplicated server-side) and retries the capture.
+        func isCurrent(_ result: TypeRoundResult) -> Bool {
+            !isTypeInvalidated(result.type.identifier, since: rrState.typeEpoch)
+        }
+
         func completesType(_ result: TypeRoundResult) -> Bool {
             guard result.isDone else { return false }
             guard fullExport else { return true }
@@ -1162,32 +1329,36 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return false
         }
 
-        for result in round.emptyDone {
+        for result in round.emptyDone where isCurrent(result) {
             let isComplete = completesType(result)
-            updateTypeProgress(
+            let saved = updateTypeProgress(
                 typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: isComplete,
-                anchorData: fullExport ? rrState.capturedAnchorData[result.type.identifier] : result.anchorData
+                anchorData: fullExport ? rrState.capturedAnchorData[result.type.identifier] : result.anchorData,
+                runEpoch: rrState.typeEpoch,
+                settlesResync: !result.failed
             )
-            if fullExport && isComplete { fireTypeCompletedLog(result.type.identifier) }
+            if fullExport && isComplete && saved { fireTypeCompletedLog(result.type.identifier) }
         }
 
-        for result in round.withData {
+        for result in round.withData where isCurrent(result) {
             let isComplete = completesType(result)
             if fullExport {
                 // The anchor persisted here is the baseline captured BEFORE the type's
                 // first page — never one captured at completion, which would baseline
                 // past everything written or deleted while the export ran.
-                updateTypeProgress(
+                let saved = updateTypeProgress(
                     typeIdentifier: result.type.identifier, sentInChunk: result.count,
                     isComplete: isComplete,
                     anchorData: rrState.capturedAnchorData[result.type.identifier],
-                    olderThan: result.nextOlderThan
+                    olderThan: result.nextOlderThan,
+                    runEpoch: rrState.typeEpoch
                 )
-                if isComplete { fireTypeCompletedLog(result.type.identifier) }
+                if isComplete && saved { fireTypeCompletedLog(result.type.identifier) }
             } else {
                 updateTypeProgress(
                     typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                    isComplete: isComplete, anchorData: result.anchorData
+                    isComplete: isComplete, anchorData: result.anchorData,
+                    runEpoch: rrState.typeEpoch
                 )
             }
         }
@@ -1214,6 +1385,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                     rrState: rrState, current: round, completion: completion
                 )
             }
+            return
+        }
+
+        // The round was fetched (often prefetched under the previous upload) before a
+        // pause could land. Once `pauseTypes` returns the app may delete that type on the
+        // server, so a chunk sent now would bring it back.
+        guard let current = excludingInvalidatedTypes(current, typeEpoch: rrState.typeEpoch) else {
+            completion(false)
             return
         }
 
@@ -1355,13 +1534,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         } else {
             let anchor = rrState.anchorCursors[type.identifier]
             fetchOneChunkIncremental(type: type, anchor: anchor, chunkLimit: chunkLimit, generation: rrState.generation) {
-                [weak self] success, samples, deleted, newAnchor, anchorData, isDone in
+                [weak self] success, samples, deleted, newAnchor, anchorData, isDone, failed in
                 guard let self = self else { completion(false, accumulated); return }
                 if !success { completion(false, accumulated); return }
                 
                 let result = TypeRoundResult(
                     type: type, samples: samples, deleted: deleted, count: samples.count + deleted.count,
-                    nextOlderThan: nil, newAnchor: newAnchor, anchorData: anchorData, isDone: isDone
+                    nextOlderThan: nil, newAnchor: newAnchor, anchorData: anchorData, isDone: isDone,
+                    failed: failed
                 )
                 self.fetchTypesInRound(
                     types: types, index: index + 1, fullExport: fullExport,
@@ -1428,9 +1608,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     private func fetchOneChunkIncremental(
         type: HKSampleType, anchor: HKQueryAnchor?, chunkLimit: Int, generation: Int,
-        completion: @escaping (_ success: Bool, _ samples: [HKSample], _ deleted: [[String: Any]], _ newAnchor: HKQueryAnchor?, _ anchorData: Data?, _ isDone: Bool) -> Void
+        completion: @escaping (_ success: Bool, _ samples: [HKSample], _ deleted: [[String: Any]], _ newAnchor: HKQueryAnchor?, _ anchorData: Data?, _ isDone: Bool, _ failed: Bool) -> Void
     ) {
-        if isSyncCancelled(generation: generation) { completion(false, [], [], nil, nil, false); return }
+        if isSyncCancelled(generation: generation) { completion(false, [], [], nil, nil, false, false); return }
         
         let syncPredicate: NSPredicate? = {
             guard let start = syncStartDate() else { return nil }
@@ -1440,19 +1620,19 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkLimit) {
             [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
             autoreleasepool {
-                guard let self = self else { completion(false, [], [], nil, nil, false); return }
+                guard let self = self else { completion(false, [], [], nil, nil, false, false); return }
                 
-                if self.isSyncCancelled(generation: generation) { completion(false, [], [], nil, nil, false); return }
+                if self.isSyncCancelled(generation: generation) { completion(false, [], [], nil, nil, false, false); return }
                 
                 if let error = error {
                     if self.isProtectedDataError(error) {
                         self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible - pausing sync")
                         self.pendingSyncAfterUnlock = true
-                        completion(false, [], [], nil, nil, false)
+                        completion(false, [], [], nil, nil, false, false)
                         return
                     }
-                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
-                    completion(true, [], [], nil, nil, true)
+                    self.logDiagnostic("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping until the next sync")
+                    completion(true, [], [], nil, nil, true, true)
                     return
                 }
                 
@@ -1467,7 +1647,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 
                 if samples.isEmpty && deletedCount == 0 {
                     self.logMessage("  \(self.shortTypeName(type.identifier)): complete")
-                    completion(true, [], [], newAnchor, anchorData, true)
+                    completion(true, [], [], newAnchor, anchorData, true, false)
                     return
                 }
                 
@@ -1476,7 +1656,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 // for the remaining (unfetched) data was never advanced.
                 let isLastChunk = (samples.count + deletedCount) < chunkLimit
                 self.logMessage("  \(self.shortTypeName(type.identifier)): \(samples.count) samples" + (deletedCount > 0 ? ", \(deletedCount) deleted" : ""))
-                completion(true, samples, deleted, newAnchor, anchorData, isLastChunk)
+                completion(true, samples, deleted, newAnchor, anchorData, isLastChunk, false)
             }
         }
         
@@ -1577,11 +1757,42 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// must not clear it, otherwise it would let a third run start on top of a live one.
     internal func finishSync(generation: Int) {
         syncLock.lock()
-        defer { syncLock.unlock() }
-        guard generation == syncGeneration else { return }
+        guard generation == syncGeneration else {
+            syncLock.unlock()
+            return
+        }
         isSyncing = false
         isInitialSyncInProgress = false
         cancelRequestedAt = nil
+        let rerun = typeChangeSyncPending
+        typeChangeSyncPending = false
+        syncLock.unlock()
+        
+        if rerun && OpenWearablesHealthSdkKeychain.isSyncActive() {
+            logMessage("Starting sync for types resumed or resynced during the last run")
+            DispatchQueue.main.async { [weak self] in
+                // Background sync may have been stopped in the meantime.
+                guard OpenWearablesHealthSdkKeychain.isSyncActive() else { return }
+                self?.syncAll(fullExport: false) { }
+            }
+        }
+    }
+    
+    /// Starts a sync after a resume or resync, or - when a run owns the slot - has it
+    /// start once that run unwinds. Check-and-set under `syncLock` so the request
+    /// cannot fall between the run releasing the slot and reading the flag. Only while
+    /// background sync is on, like `resetAnchors()`; otherwise the next start picks the
+    /// change up.
+    internal func requestSyncAfterTypeChange() {
+        guard OpenWearablesHealthSdkKeychain.isSyncActive(), hasAuth else { return }
+        syncLock.lock()
+        if isSyncing {
+            typeChangeSyncPending = true
+            syncLock.unlock()
+            return
+        }
+        syncLock.unlock()
+        syncAll(fullExport: false) { }
     }
     
     /// Returns the remaining background execution time when the app is in the

@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.19.0
+
+* **Per-type pause / resume / resync**: `pauseTypes(types:)`, `resumeTypes(types:)`, `getPausedTypes()` and `resyncTypes(types:completion:)` (plus an `async` form) take `HealthDataType` raw values.
+  - A paused type is skipped by every sync, including the initial export, and loses its observer and background delivery; its anchor is kept, so resume continues from it and picks up changes and deletions made meanwhile. A type without an anchor (paused before its first export finished) has its history read again on resume. Aliases pause together (`restingEnergy`/`basalEnergy`, `bloodOxygen`/`oxygenSaturation`); `bloodPressure` stands for its systolic and diastolic types.
+  - The paused list is stored per user in the config suite, independent of the authorized types; it survives `resetAnchors()` and is cleared by `signOut()`.
+  - `resyncTypes` drops the type's anchor and session progress, so the next sync reads its history again (bounded by `syncDaysBack`) as part of a `live` session, or inside the initial export when that export already finished the type. Paused, unknown and untracked types are ignored; before the initial export is done, types it has not finished are left to it. `resetAnchors()` cancels pending resyncs.
+  - `getSyncStatus()` gains `pausedTypes` and `resyncingTypes`.
+  - A sync run already in flight stops reading a type paused or resynced under it, drops it from the round it is about to upload (only a batch already on the wire can still carry it) and never saves that type's progress or anchor. A resume or resync during a run starts another sync once it ends.
+* **`resetAnchors()` clears every type's anchor**, not only the currently tracked ones.
 
 ## 0.18.0
 

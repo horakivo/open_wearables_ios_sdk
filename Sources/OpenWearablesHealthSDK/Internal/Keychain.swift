@@ -134,6 +134,29 @@ internal class OpenWearablesHealthSdkKeychain {
         return defaults.stringArray(forKey: trackedTypesKey)
     }
     
+    // MARK: - Paused Types
+    
+    /// Wrapper type ids the user paused, exactly as the app sent them. Kept per user in
+    /// the config suite so a background sync in a fresh process honours them before
+    /// `configure` runs. Not part of `clearAll`: the key carries the user id, so
+    /// `signOut` clears it explicitly while that id is still known.
+    private static func pausedTypesKey(userKey: String) -> String {
+        "pausedTypes.\(userKey)"
+    }
+    
+    static func savePausedTypes(_ types: [String], userKey: String) {
+        if types.isEmpty {
+            defaults.removeObject(forKey: pausedTypesKey(userKey: userKey))
+        } else {
+            defaults.set(types, forKey: pausedTypesKey(userKey: userKey))
+        }
+        defaults.synchronize()
+    }
+    
+    static func getPausedTypes(userKey: String) -> [String] {
+        return defaults.stringArray(forKey: pausedTypesKey(userKey: userKey)) ?? []
+    }
+    
     // MARK: - Sync Days Back
     
     static func saveSyncDaysBack(_ days: Int) {

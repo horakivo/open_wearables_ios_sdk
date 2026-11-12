@@ -78,8 +78,21 @@ extension OpenWearablesHealthSDK {
         return state
     }
     
-    internal func updateTypeProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Bool, anchorData: Data?, olderThan: Date? = nil) {
-        guard var state = loadSyncState() else { return }
+    /// Records a committed round for one type. `runEpoch` is the `typeEpoch` the
+    /// calling run started at: when the type was paused, resynced or reset since, the
+    /// write is skipped so the run cannot put back an anchor or cursor that was just
+    /// removed. `settlesResync` is false when the type was skipped on an error: its
+    /// position is saved, but a pending resync of it has not read everything yet.
+    /// Returns whether anything was written.
+    @discardableResult
+    internal func updateTypeProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Bool, anchorData: Data?, olderThan: Date? = nil, runEpoch: Int? = nil, settlesResync: Bool = true) -> Bool {
+        typeStateLock.lock()
+        defer { typeStateLock.unlock() }
+        if let runEpoch = runEpoch, isTypeInvalidated(typeIdentifier, since: runEpoch) {
+            logMessage("  \(shortTypeName(typeIdentifier)): paused or resynced during this run - progress not saved")
+            return false
+        }
+        guard var state = loadSyncState() else { return false }
         
         var progress = state.typeProgress[typeIdentifier] ?? TypeSyncProgress(
             typeIdentifier: typeIdentifier,
@@ -106,12 +119,18 @@ extension OpenWearablesHealthSDK {
             if let anchorData = progress.pendingAnchorData {
                 saveAnchorData(anchorData, typeIdentifier: typeIdentifier, userKey: state.userKey)
             }
+            if settlesResync {
+                settleResyncs(completed: typeIdentifier)
+            }
         }
         
         saveSyncState(state)
+        return true
     }
     
     internal func updateCurrentTypeIndex(_ index: Int) {
+        typeStateLock.lock()
+        defer { typeStateLock.unlock() }
         guard var state = loadSyncState() else { return }
         state.currentTypeIndex = index
         saveSyncState(state)
@@ -128,6 +147,8 @@ extension OpenWearablesHealthSDK {
     /// Session id and type the backend uses to group batches and log events into one
     /// `SyncRun`. Generates and persists an id if the on-disk state predates the field.
     internal func currentSyncAttribution() -> (sessionId: String, syncType: String)? {
+        typeStateLock.lock()
+        defer { typeStateLock.unlock() }
         guard var state = loadSyncState() else { return nil }
         if let sessionId = state.sessionId, !sessionId.isEmpty {
             return (sessionId, state.syncType)
@@ -139,6 +160,8 @@ extension OpenWearablesHealthSDK {
     }
     
     internal func startNewSyncState(fullExport: Bool, types: [HKSampleType]) -> SyncState {
+        typeStateLock.lock()
+        defer { typeStateLock.unlock() }
         let state = SyncState(
             userKey: userKey(),
             fullExport: fullExport,
@@ -157,6 +180,8 @@ extension OpenWearablesHealthSDK {
     // MARK: - Finalize Sync (mark complete)
     
     internal func finalizeSyncState() {
+        typeStateLock.lock()
+        defer { typeStateLock.unlock() }
         guard let state = loadSyncState() else { return }
         
         if state.fullExport {
@@ -212,6 +237,9 @@ extension OpenWearablesHealthSDK {
         // has ever completed for this user. False = historical sync still pending
         // or in progress; apps can use this to show a "keep the app open" hint.
         let initialExportDone = defaults.bool(forKey: fullDoneKey())
+        let pausedTypes = getPausedTypes()
+        // Pending or running; a resync of a type paused since stays pending until resume.
+        let resyncingTypes = loadResyncTypeIds()
         
         if let state = loadSyncState() {
             return [
@@ -221,6 +249,8 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": state.fullExport,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncingVisible,
+                "pausedTypes": pausedTypes,
+                "resyncingTypes": resyncingTypes,
                 "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
             ]
         } else {
@@ -231,6 +261,8 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": false,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncingVisible,
+                "pausedTypes": pausedTypes,
+                "resyncingTypes": resyncingTypes,
                 "createdAt": NSNull()
             ]
         }

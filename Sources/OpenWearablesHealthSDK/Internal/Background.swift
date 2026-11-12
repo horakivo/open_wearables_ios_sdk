@@ -7,37 +7,49 @@ extension OpenWearablesHealthSDK {
 
     // MARK: - Background delivery
     internal func startBackgroundDelivery() {
+        observerQueriesLock.lock()
+        defer { observerQueriesLock.unlock() }
         for q in activeObserverQueries { healthStore.stop(q) }
         activeObserverQueries.removeAll()
 
-        let observableTypes = getQueryableTypes()
+        // Paused types get no observer and no background delivery; `resumeTypes`
+        // registers them again.
+        let paused = pausedHKIdentifiers()
+        let observableTypes = getQueryableTypes().filter { !paused.contains($0.identifier) }
 
         for type in observableTypes {
-            let observer = HKObserverQuery(sampleType: type, predicate: nil) { [weak self] _, completionHandler, error in
-                guard let self = self else {
-                    completionHandler()
-                    return
-                }
-
-                if let error = error {
-                    print("Observer error for \(type.identifier): \(error.localizedDescription)")
-                    completionHandler()
-                    return
-                }
-
-                self.triggerCombinedSync()
-                completionHandler()
-            }
-            healthStore.execute(observer)
-            activeObserverQueries.append(observer)
-            healthStore.enableBackgroundDelivery(for: type, frequency: .immediate) { _, _ in }
+            registerObserver(for: type)
         }
         logMessage("Background observers registered for \(observableTypes.count) types")
     }
 
+    /// Callers hold `observerQueriesLock`.
+    internal func registerObserver(for type: HKSampleType) {
+        let observer = HKObserverQuery(sampleType: type, predicate: nil) { [weak self] _, completionHandler, error in
+            guard let self = self else {
+                completionHandler()
+                return
+            }
+
+            if let error = error {
+                print("Observer error for \(type.identifier): \(error.localizedDescription)")
+                completionHandler()
+                return
+            }
+
+            self.triggerCombinedSync()
+            completionHandler()
+        }
+        healthStore.execute(observer)
+        activeObserverQueries.append(observer)
+        healthStore.enableBackgroundDelivery(for: type, frequency: .immediate) { _, _ in }
+    }
+
     internal func stopBackgroundDelivery() {
+        observerQueriesLock.lock()
         for q in activeObserverQueries { healthStore.stop(q) }
         activeObserverQueries.removeAll()
+        observerQueriesLock.unlock()
         
         let observableTypes = getQueryableTypes()
         
